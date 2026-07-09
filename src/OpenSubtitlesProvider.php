@@ -94,6 +94,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface
 
     /**
      * Logger instance.
+     *
+     * @var LoggerInterface
      */
     private LoggerInterface $logger;
 
@@ -147,7 +149,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface
     public function onEnable(ContainerInterface $container): void
     {
         if ($container->has(LoggerInterface::class)) {
-            $this->logger = $container->get(LoggerInterface::class);
+            /** @var LoggerInterface */
+            $logger = $container->get(LoggerInterface::class);
+            $this->logger = $logger;
         }
 
         if ($this->username !== null && $this->password !== null) {
@@ -207,9 +211,10 @@ final class OpenSubtitlesProvider implements LifecycleInterface
                 ],
             ]);
 
+            /** @var array<string, mixed> */
             $data = json_decode((string) $response->getBody(), true);
 
-            if (isset($data['token'])) {
+            if (isset($data['token']) && is_string($data['token'])) {
                 $this->sessionToken = $data['token'];
                 $this->logger->info('OpenSubtitles login successful');
             }
@@ -222,8 +227,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface
     /**
      * Search for subtitles matching the given IMDB ID.
      *
-     * @param string $imdbId      IMDB ID (e.g., "tt1234567").
-     * @param string $language    Language code (ISO 639-1).
+     * @param string $imdbId         IMDB ID (e.g., "tt1234567").
+     * @param string $language       Language code (ISO 639-1).
      * @param string $subtitleFormat Preferred format (srt, sub, ass, etc.).
      *
      * @return list<array{id: int, language: string, format: string, downloads: int, filename: string}>
@@ -255,9 +260,13 @@ final class OpenSubtitlesProvider implements LifecycleInterface
                 'headers' => $headers,
             ]);
 
+            /** @var array<string, mixed> */
             $data = json_decode((string) $response->getBody(), true);
 
-            return $this->filterSubtitles($data['data'] ?? [], $subtitleFormat);
+            /** @var list<array<string, mixed>> */
+            $subtitles = is_array($data['data'] ?? null) ? $data['data'] : [];
+
+            return $this->filterSubtitles($subtitles, $subtitleFormat);
         } catch (GuzzleException $e) {
             $this->logger->error('OpenSubtitles search by IMDB ID failed: ' . $e->getMessage());
             throw new OpenSubtitlesException('Search by IMDB ID failed: ' . $e->getMessage(), 0, $e);
@@ -267,8 +276,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface
     /**
      * Search for subtitles matching the given filename.
      *
-     * @param string $filename      Media filename.
-     * @param string $language      Language code (ISO 639-1).
+     * @param string $filename       Media filename.
+     * @param string $language       Language code (ISO 639-1).
      * @param string $subtitleFormat Preferred format (srt, sub, ass, etc.).
      *
      * @return list<array{id: int, language: string, format: string, downloads: int, filename: string}>
@@ -311,9 +320,13 @@ final class OpenSubtitlesProvider implements LifecycleInterface
                     'headers' => $headers,
                 ]);
 
+                /** @var array<string, mixed> */
                 $data = json_decode((string) $response->getBody(), true);
 
-                return $this->filterSubtitles($data['data'] ?? [], $subtitleFormat);
+            /** @var list<array<string, mixed>> */
+            $subtitles = is_array($data['data'] ?? null) ? $data['data'] : [];
+
+            return $this->filterSubtitles($subtitles, $subtitleFormat);
             }
 
             return [];
@@ -326,9 +339,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface
     /**
      * Search for subtitles matching the given file hash.
      *
-     * @param string $hash          OpenSubtitles hash (first 64KB + last 64KB of file).
-     * @param int    $size          File size in bytes.
-     * @param string $language      Language code (ISO 639-1).
+     * @param string $hash           OpenSubtitles hash (first 64KB + last 64KB of file).
+     * @param int    $size           File size in bytes.
+     * @param string $language       Language code (ISO 639-1).
      * @param string $subtitleFormat Preferred format (srt, sub, ass, etc.).
      *
      * @return list<array{id: int, language: string, format: string, downloads: int, filename: string}>
@@ -360,9 +373,13 @@ final class OpenSubtitlesProvider implements LifecycleInterface
                 'headers' => $headers,
             ]);
 
+            /** @var array<string, mixed> */
             $data = json_decode((string) $response->getBody(), true);
 
-            return $this->filterSubtitles($data['data'] ?? [], $subtitleFormat);
+            /** @var list<array<string, mixed>> */
+            $subtitles = is_array($data['data'] ?? null) ? $data['data'] : [];
+
+            return $this->filterSubtitles($subtitles, $subtitleFormat);
         } catch (GuzzleException $e) {
             $this->logger->error('OpenSubtitles search by hash failed: ' . $e->getMessage());
             throw new OpenSubtitlesException('Search by hash failed: ' . $e->getMessage(), 0, $e);
@@ -400,12 +417,24 @@ final class OpenSubtitlesProvider implements LifecycleInterface
                 ],
             ]);
 
+            /** @var array<string, mixed> */
             $data = json_decode((string) $response->getBody(), true);
 
+            $content = '';
+            if (isset($data['content']) && is_string($data['content'])) {
+                $decoded = base64_decode($data['content'], true);
+                $content = is_string($decoded) ? $decoded : '';
+            }
+
+            $format = is_string($data['format'] ?? null) ? $data['format'] : $this->format;
+            $fileName = is_string($data['file_name'] ?? null)
+                ? $data['file_name']
+                : "subtitle.{$this->format}";
+
             return new SubtitleDownload(
-                content: base64_decode($data['content'] ?? ''),
-                format: $data['format'] ?? $this->format,
-                fileName: $data['file_name'] ?? "subtitle.{$this->format}",
+                content: $content,
+                format: $format,
+                fileName: $fileName,
             );
         } catch (GuzzleException $e) {
             $this->logger->error('OpenSubtitles download failed: ' . $e->getMessage());
@@ -445,9 +474,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface
         }
 
         // Extract title and year if possible
-        if (preg_match('/^(.+?)[.\s]+(\d{4})/', basename($filename), $matches)) {
-            $result['title'] = trim($matches[1], '.[\\s');
-            $result['year'] = (int) $matches[2];
+        if (preg_match('/^(.+?)[.\\s]+(\\d{4})/', basename($filename), $yearMatches)) {
+            $result['title'] = trim($yearMatches[1], '.[\\s');
+            $result['year'] = (int) $yearMatches[2];
         }
 
         return $result;
@@ -456,8 +485,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface
     /**
      * Filter subtitles to prefer the requested format.
      *
-     * @param list<array<string, mixed>> $subtitles    Raw subtitles from API.
-     * @param string                    $preferredFormat Preferred format.
+     * @param array<array<string, mixed>> $subtitles       Raw subtitles from API.
+     * @param string                      $preferredFormat Preferred format.
      *
      * @return list<array{id: int, language: string, format: string, downloads: int, filename: string}>
      *
@@ -468,24 +497,31 @@ final class OpenSubtitlesProvider implements LifecycleInterface
         $results = [];
 
         foreach ($subtitles as $subtitle) {
-            $attributes = $subtitle['attributes'] ?? [];
+            /** @var array<string, mixed> */
+            $attributes = is_array($subtitle['attributes'] ?? null) ? $subtitle['attributes'] : [];
 
-            $fileInfo = $attributes['file'] ?? [];
-            $format = $fileInfo['format'] ?? 'srt';
-            $languageCode = $attributes['language'] ?? 'en';
+            /** @var array<string, mixed> */
+            $fileInfo = is_array($attributes['file'] ?? null) ? $attributes['file'] : [];
+
+            $format = is_string($fileInfo['format'] ?? null) ? $fileInfo['format'] : 'srt';
+            $languageCode = is_string($attributes['language'] ?? null) ? $attributes['language'] : 'en';
+            $downloadCount = is_int($attributes['download_count'] ?? null) ? $attributes['download_count'] : 0;
+            $filename = is_string($fileInfo['filename'] ?? null) ? $fileInfo['filename'] : "subtitle.{$format}";
+            $imdbId = is_string($attributes['imdb_id'] ?? null) ? $attributes['imdb_id'] : null;
+            $subtitleId = is_int($subtitle['id'] ?? null) ? $subtitle['id'] : 0;
 
             $results[] = [
-                'id' => (int) ($subtitle['id'] ?? 0),
+                'id' => $subtitleId,
                 'language' => $languageCode,
                 'format' => $format,
-                'downloads' => (int) ($attributes['download_count'] ?? 0),
-                'filename' => $fileInfo['filename'] ?? "subtitle.{$format}",
-                'imdb_id' => $attributes['imdb_id'] ?? null,
+                'downloads' => $downloadCount,
+                'filename' => $filename,
+                'imdb_id' => $imdbId,
             ];
         }
 
-        // Sort by download count descending, then by format match
-        usort($results, static fn (array $a, array $b) => $b['downloads'] <=> $a['downloads']);
+        // Sort by download count descending
+        usort($results, static fn (array $a, array $b): int => $b['downloads'] <=> $a['downloads']);
 
         return $results;
     }
