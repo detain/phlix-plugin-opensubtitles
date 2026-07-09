@@ -1,0 +1,48 @@
+{
+    "name": "detain/phlix-plugin-opensubtitles",
+    "type": "phlix-plugin",
+    "description": "OpenSubtitles subtitle provider for Phlix — search and download subtitles for movies and TV shows via the OpenSubtitles REST API.",
+    "license": "MIT",
+    "keywords": [
+        "phlix",
+        "phlix-plugin",
+        "subtitle-provider",
+        "opensubtitles",
+        "subtitles",
+        "srt",
+        "captions"
+    ],
+    "homepage": "https://github.com/detain/phlix-plugin-opensubtitles",
+    "require": {
+        "php": ">=8.3",
+        "detain/phlix-shared": "^0.12.0",
+        "psr/container": "^1.1 || ^2.0",
+        "guzzlehttp/guzzle": "^7.9"
+    },
+    "require-dev": {
+        "phpstan/phpstan": "^2.2",
+        "phpunit/phpunit": "^10.0",
+        "squizlabs/php_codesniffer": "^4.0"
+    },
+    "repositories": [
+        { "type": "vcs", "url": "https://github.com/detain/phlix-shared.git" }
+    ],
+    "autoload": {
+        "psr-4": {
+            "Phlix\\PluginOpenSubtitles\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Phlix\\PluginOpenSubtitles\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "sort-packages": true
+    },
+    "scripts": {
+        "phpstan": "vendor/bin/phpstan analyse src --level=9",
+        "phpcs": "vendor/bin/phpcs src --standard=PSR12"
+    }
+}

@@ -1,0 +1,41 @@
+{
+    "name": "phlix-plugin-opensubtitles",
+    "version": "0.1.0",
+    "phlix_min_server_version": "0.10.0",
+    "type": "subtitle-provider",
+    "entry": "Phlix\\PluginOpenSubtitles\\OpenSubtitlesProvider",
+    "events": [],
+    "settings": {
+        "api_key": {
+            "type": "string",
+            "required": true,
+            "default": null,
+            "description": "OpenSubtitles API key (user agent token)"
+        },
+        "username": {
+            "type": "string",
+            "required": false,
+            "default": null,
+            "description": "OpenSubtitles username (optional, for logged-in downloads)"
+        },
+        "password": {
+            "type": "string",
+            "required": false,
+            "default": null,
+            "description": "OpenSubtitles password (optional, for logged-in downloads)"
+        },
+        "language": {
+            "type": "string",
+            "required": false,
+            "default": "en",
+            "description": "Default subtitle language code (ISO 639-1)"
+        },
+        "format": {
+            "type": "string",
+            "required": false,
+            "default": "srt",
+            "description": "Preferred subtitle format (srt, sub, ass, etc.)"
+        }
+    },
+    "signature": null
+}
