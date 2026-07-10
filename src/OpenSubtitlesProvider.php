@@ -323,10 +323,10 @@ final class OpenSubtitlesProvider implements LifecycleInterface
                 /** @var array<string, mixed> */
                 $data = json_decode((string) $response->getBody(), true);
 
-            /** @var list<array<string, mixed>> */
-            $subtitles = is_array($data['data'] ?? null) ? $data['data'] : [];
+                /** @var list<array<string, mixed>> */
+                $subtitles = is_array($data['data'] ?? null) ? $data['data'] : [];
 
-            return $this->filterSubtitles($subtitles, $subtitleFormat);
+                return $this->filterSubtitles($subtitles, $subtitleFormat);
             }
 
             return [];
