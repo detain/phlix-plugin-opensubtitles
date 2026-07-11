@@ -13,6 +13,7 @@ namespace Phlix\PluginOpenSubtitles;
 
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
+use Phlix\Shared\Plugin\ConfigurableInterface;
 use Phlix\Shared\Plugin\LifecycleInterface;
 use Psr\Container\ContainerInterface;
 use Psr\Log\LoggerInterface;
@@ -40,7 +41,7 @@ use Psr\Log\NullLogger;
  * @package Phlix\PluginOpenSubtitles
  * @since 0.1.0
  */
-final class OpenSubtitlesProvider implements LifecycleInterface
+final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInterface
 {
     /**
      * OpenSubtitles API base URL.
@@ -112,17 +113,59 @@ final class OpenSubtitlesProvider implements LifecycleInterface
      * @param string      $format   Preferred subtitle format.
      */
     public function __construct(
-        string $apiKey,
+        string $apiKey = '',
         ?string $username = null,
         ?string $password = null,
         string $language = self::DEFAULT_LANGUAGE,
         string $format = self::DEFAULT_FORMAT,
     ) {
+        // The constructor MUST stay autowirable — the host loader builds the
+        // entry class through its PSR-11 container, which cannot guess a
+        // required `string $apiKey`. So the key defaults to '' here and the real
+        // settings arrive via configure() before onEnable().
         $this->apiKey = $apiKey;
         $this->username = $username;
         $this->password = $password;
         $this->language = $language;
         $this->format = $format;
+        $this->rebuildHttpClient();
+        $this->logger = new NullLogger();
+    }
+
+    /**
+     * Receive the plugin's persisted settings from the host.
+     *
+     * Called once by the loader between construction and {@see onEnable()}, so
+     * onEnable() authenticates with the configured API key/credentials.
+     *
+     * @param array<string, mixed> $settings Persisted settings (manifest keys:
+     *        `api_key`, `username`, `password`, `language`, `format`).
+     *
+     * @return void
+     *
+     * @since 0.2.0
+     */
+    public function configure(array $settings): void
+    {
+        $this->apiKey = is_string($settings['api_key'] ?? null) ? $settings['api_key'] : '';
+        $this->username = self::nonEmptyString($settings['username'] ?? null);
+        $this->password = self::nonEmptyString($settings['password'] ?? null);
+        $this->language = is_string($settings['language'] ?? null) && $settings['language'] !== ''
+            ? $settings['language']
+            : self::DEFAULT_LANGUAGE;
+        $this->format = is_string($settings['format'] ?? null) && $settings['format'] !== ''
+            ? $settings['format']
+            : self::DEFAULT_FORMAT;
+        $this->rebuildHttpClient();
+    }
+
+    /**
+     * (Re)build the API HTTP client so it carries the current `Api-Key` header.
+     * Called from the constructor and whenever settings change via
+     * {@see configure()}.
+     */
+    private function rebuildHttpClient(): void
+    {
         $this->httpClient = new Client([
             'base_uri' => self::API_BASE,
             'timeout' => 30,
@@ -132,7 +175,14 @@ final class OpenSubtitlesProvider implements LifecycleInterface
                 'Accept' => 'application/json',
             ],
         ]);
-        $this->logger = new NullLogger();
+    }
+
+    /**
+     * Coerce a raw settings value to a non-empty string, or null.
+     */
+    private static function nonEmptyString(mixed $value): ?string
+    {
+        return is_string($value) && $value !== '' ? $value : null;
     }
 
     /**

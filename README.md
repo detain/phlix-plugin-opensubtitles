@@ -29,13 +29,21 @@ The plugin is unsigned by design. Install via the Phlix admin UI:
 
 ## Configuration
 
-| Setting      | Required | Default | Description                                      |
-|--------------|----------|---------|--------------------------------------------------|
-| `api_key`    | Yes      | —       | OpenSubtitles API key (user agent token)         |
-| `username`   | No       | —       | OpenSubtitles username (for logged-in downloads)  |
-| `password`   | No       | —       | OpenSubtitles password (for logged-in downloads) |
-| `language`   | No       | `en`    | Default subtitle language (ISO 639-1)            |
-| `format`     | No       | `srt`   | Preferred subtitle format (srt, sub, ass, etc.)   |
+Configure these in the Phlix admin **Plugins → Configure** dialog.
+
+| Setting      | Required | Secret | Default | Description                                      |
+|--------------|----------|--------|---------|--------------------------------------------------|
+| `api_key`    | **Yes**  | yes    | —       | API key for your OpenSubtitles.com consumer (API application). |
+| `username`   | No       | —      | —       | OpenSubtitles.com username. Raises download limits (VIP limits for VIP accounts). |
+| `password`   | No       | yes    | —       | OpenSubtitles.com password. Only used with the username. |
+| `language`   | No       | —      | `en`    | Default subtitle language (ISO 639-1, e.g. en, es, fr). |
+| `format`     | No       | —      | `srt`   | Preferred subtitle format (srt, sub, ass, etc.). |
+
+### Where to get your API key
+
+Create a **consumer** (API application) on OpenSubtitles.com and copy its API key:
+[opensubtitles.com/en/consumers](https://www.opensubtitles.com/en/consumers). Providing your
+account `username`/`password` as well is optional but raises your download quota.
 
 ## How it works
 
