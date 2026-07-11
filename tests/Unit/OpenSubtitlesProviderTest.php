@@ -50,6 +50,43 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertFalse($provider->isLoggedIn());
     }
 
+    public function test_constructor_is_autowirable_with_no_arguments(): void
+    {
+        // The host container builds the entry class with zero args — it must not
+        // throw, and it must implement the settings-injection contract.
+        $provider = new OpenSubtitlesProvider();
+
+        $this->assertInstanceOf(\Phlix\Shared\Plugin\LifecycleInterface::class, $provider);
+        $this->assertInstanceOf(\Phlix\Shared\Plugin\ConfigurableInterface::class, $provider);
+        $this->assertSame('en', $provider->getLanguage());
+        $this->assertSame('srt', $provider->getFormat());
+    }
+
+    public function test_configure_applies_persisted_settings(): void
+    {
+        $provider = new OpenSubtitlesProvider();
+        $provider->configure([
+            'api_key'  => self::TEST_API_KEY,
+            'username' => 'testuser',
+            'password' => 'testpass',
+            'language' => 'de',
+            'format'   => 'ass',
+        ]);
+
+        $this->assertSame('de', $provider->getLanguage());
+        $this->assertSame('ass', $provider->getFormat());
+        $this->assertFalse($provider->isLoggedIn());
+    }
+
+    public function test_configure_falls_back_to_defaults_for_blank_values(): void
+    {
+        $provider = new OpenSubtitlesProvider();
+        $provider->configure(['api_key' => self::TEST_API_KEY, 'language' => '', 'format' => '']);
+
+        $this->assertSame('en', $provider->getLanguage());
+        $this->assertSame('srt', $provider->getFormat());
+    }
+
     public function test_compute_hash_returns_empty_for_nonexistent_file(): void
     {
         $hash = OpenSubtitlesProvider::computeHash('/nonexistent/path/file.mkv');

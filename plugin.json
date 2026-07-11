@@ -1,7 +1,7 @@
 {
     "name": "phlix-plugin-opensubtitles",
-    "version": "0.1.0",
-    "phlix_min_server_version": "0.10.0",
+    "version": "0.2.0",
+    "phlix_min_server_version": "1.2.0",
     "type": "subtitle-provider",
     "entry": "Phlix\\PluginOpenSubtitles\\OpenSubtitlesProvider",
     "events": [],
@@ -9,32 +9,41 @@
         "api_key": {
             "type": "string",
             "required": true,
+            "secret": true,
             "default": null,
-            "description": "OpenSubtitles API key (user agent token)"
+            "label": "OpenSubtitles API Key",
+            "description": "The API key for your OpenSubtitles.com consumer (API application). Required.",
+            "link": "https://www.opensubtitles.com/en/consumers",
+            "link_text": "OpenSubtitles API consumers"
         },
         "username": {
             "type": "string",
             "required": false,
             "default": null,
-            "description": "OpenSubtitles username (optional, for logged-in downloads)"
+            "label": "Username",
+            "description": "Your OpenSubtitles.com username. Optional — providing login credentials raises download limits (and unlocks VIP limits for VIP accounts)."
         },
         "password": {
             "type": "string",
             "required": false,
+            "secret": true,
             "default": null,
-            "description": "OpenSubtitles password (optional, for logged-in downloads)"
+            "label": "Password",
+            "description": "Your OpenSubtitles.com password. Optional; only used together with the username above."
         },
         "language": {
             "type": "string",
             "required": false,
             "default": "en",
-            "description": "Default subtitle language code (ISO 639-1)"
+            "label": "Subtitle language",
+            "description": "Preferred subtitle language as an ISO 639-1 code (e.g. en, es, fr). Optional; default en."
         },
         "format": {
             "type": "string",
             "required": false,
             "default": "srt",
-            "description": "Preferred subtitle format (srt, sub, ass, etc.)"
+            "label": "Subtitle format",
+            "description": "Preferred subtitle format (srt, sub, ass, etc.). Optional; default srt."
         }
     },
     "signature": null
