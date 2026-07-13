@@ -11,10 +11,17 @@ declare(strict_types=1);
 
 namespace Phlix\PluginOpenSubtitles\Tests;
 
+use GuzzleHttp\Client;
+use GuzzleHttp\Handler\MockHandler;
+use GuzzleHttp\HandlerStack;
+use GuzzleHttp\Middleware;
+use GuzzleHttp\Psr7\Response;
 use Phlix\PluginOpenSubtitles\OpenSubtitlesException;
 use Phlix\PluginOpenSubtitles\OpenSubtitlesProvider;
 use Phlix\PluginOpenSubtitles\SubtitleDownload;
 use PHPUnit\Framework\TestCase;
+use Psr\Container\ContainerInterface;
+use Psr\Http\Message\RequestInterface;
 
 /**
  * Smoke tests for the {@see OpenSubtitlesProvider} plugin.
@@ -243,5 +250,104 @@ final class OpenSubtitlesProviderTest extends TestCase
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
 
         $this->assertSame([], $provider->subscribedEvents());
+    }
+
+    /**
+     * Regression test for the production 404 bug: `onEnable()` posted to
+     * `https://api.opensubtitles.com/v2/uselogin` instead of the real
+     * OpenSubtitles REST API v1 login endpoint. Guzzle's `base_uri` +
+     * leading-slash request path resolution (RFC 3986 §5.3) silently
+     * discards the base URI's path component, so this must be asserted
+     * against the fully resolved request URI — not just the path literal
+     * in the source — or the bug would have shipped without a red test.
+     */
+    public function test_login_posts_to_the_correct_v1_login_url(): void
+    {
+        $provider = new OpenSubtitlesProvider(
+            apiKey: self::TEST_API_KEY,
+            username: 'testuser',
+            password: 'testpass',
+        );
+
+        $history = [];
+        $this->installMockHttpClient($provider, [
+            new Response(200, [], (string) json_encode(['token' => 'session-token-123'])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->assertCount(1, $history);
+        $request = $history[0]['request'];
+        $this->assertSame('POST', $request->getMethod());
+        $this->assertSame(
+            'https://api.opensubtitles.com/api/v1/login',
+            (string) $request->getUri(),
+        );
+        $this->assertTrue($provider->isLoggedIn());
+    }
+
+    public function test_search_by_imdb_id_requests_the_correct_v1_subtitles_url(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $history = [];
+        $this->installMockHttpClient($provider, [
+            new Response(200, [], (string) json_encode(['data' => []])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $provider->searchByImdbId('tt1234567');
+
+        $this->assertCount(1, $history);
+        $request = $history[0]['request'];
+        $this->assertSame('GET', $request->getMethod());
+        $this->assertStringStartsWith(
+            'https://api.opensubtitles.com/api/v1/subtitles',
+            (string) $request->getUri(),
+        );
+    }
+
+    /**
+     * Replace the provider's internal Guzzle client with one backed by a
+     * {@see MockHandler} (same `base_uri` as production), wiring Guzzle's
+     * history middleware to append `['request' => ..., 'response' => ...]`
+     * entries into `$history` as calls happen. `$history` MUST be passed by
+     * reference from the caller (not returned) because
+     * {@see Middleware::history()} binds the container by reference at
+     * closure-creation time — returning a fresh array here would only ever
+     * capture the empty pre-call snapshot.
+     *
+     * @param list<Response>                       $responses Queued mock responses, in order.
+     * @param list<array{request: RequestInterface}> $history  Out-param; appended to as requests fire.
+     */
+    private function installMockHttpClient(OpenSubtitlesProvider $provider, array $responses, array &$history): void
+    {
+        $mock = new MockHandler($responses);
+        $stack = HandlerStack::create($mock);
+        $stack->push(Middleware::history($history));
+
+        $client = new Client([
+            'base_uri' => 'https://api.opensubtitles.com/api/v1/',
+            'handler' => $stack,
+        ]);
+
+        $property = new \ReflectionProperty(OpenSubtitlesProvider::class, 'httpClient');
+        $property->setAccessible(true);
+        $property->setValue($provider, $client);
+    }
+
+    private function stubContainer(): ContainerInterface
+    {
+        return new class implements ContainerInterface {
+            public function get(string $id): mixed
+            {
+                throw new \RuntimeException("Unexpected container lookup for {$id}");
+            }
+
+            public function has(string $id): bool
+            {
+                return false;
+            }
+        };
     }
 }

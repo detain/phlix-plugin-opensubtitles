@@ -47,7 +47,7 @@ account `username`/`password` as well is optional but raises your download quota
 
 ## How it works
 
-The plugin implements the `Phlix\Shared\Plugin\LifecycleInterface` contract and connects to the OpenSubtitles REST API v2:
+The plugin implements the `Phlix\Shared\Plugin\LifecycleInterface` contract and connects to the OpenSubtitles REST API v1:
 
 1. **Login** — registers a user agent and obtains a session token
 2. **Search** — queries subtitles by IMDB ID, filename, or hash

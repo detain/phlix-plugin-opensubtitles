@@ -22,7 +22,7 @@ use Psr\Log\NullLogger;
 /**
  * OpenSubtitles subtitle provider for Phlix.
  *
- * This plugin integrates with the OpenSubtitles REST API v2 to search
+ * This plugin integrates with the OpenSubtitles REST API v1 to search
  * and download subtitles for movies and TV shows. It supports search
  * by IMDB ID, filename, and file hash.
  *
@@ -45,8 +45,20 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
 {
     /**
      * OpenSubtitles API base URL.
+     *
+     * MUST keep the trailing slash: Guzzle resolves relative request paths
+     * against `base_uri` using RFC 3986 §5.3 reference resolution. A
+     * leading-slash request path (e.g. `/login`) is treated as an
+     * absolute-path reference and REPLACES the entire path component of
+     * `base_uri` (dropping `/api/v1` and leaving only the scheme+host) —
+     * that mismatch previously produced 404s such as
+     * `https://api.opensubtitles.com/v2/uselogin`. With a trailing slash on
+     * the base and no leading slash on request paths, RFC 3986 merge
+     * resolution correctly appends the path (e.g. `/api/v1/login`).
+     *
+     * @see https://opensubtitles.stoplight.io/docs/opensubtitles-api/73acf79accc0a-login
      */
-    private const API_BASE = 'https://api.opensubtitles.com/api/v2';
+    private const API_BASE = 'https://api.opensubtitles.com/api/v1/';
 
     /**
      * Default language code when not configured.
@@ -254,7 +266,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     private function login(): void
     {
         try {
-            $response = $this->httpClient->post('/v2/uselogin', [
+            $response = $this->httpClient->post('login', [
                 'json' => [
                     'username' => $this->username,
                     'password' => $this->password,
@@ -305,7 +317,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
                 $headers['Authorization'] = 'Bearer ' . $this->sessionToken;
             }
 
-            $response = $this->httpClient->get('/v2/subtitles', [
+            $response = $this->httpClient->get('subtitles', [
                 'query' => $queryParams,
                 'headers' => $headers,
             ]);
@@ -365,7 +377,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
                     $headers['Authorization'] = 'Bearer ' . $this->sessionToken;
                 }
 
-                $response = $this->httpClient->get('/v2/subtitles', [
+                $response = $this->httpClient->get('subtitles', [
                     'query' => $queryParams,
                     'headers' => $headers,
                 ]);
@@ -418,7 +430,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
                 $headers['Authorization'] = 'Bearer ' . $this->sessionToken;
             }
 
-            $response = $this->httpClient->get('/v2/subtitles', [
+            $response = $this->httpClient->get('subtitles', [
                 'query' => $queryParams,
                 'headers' => $headers,
             ]);
@@ -460,7 +472,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
                 $headers['Authorization'] = 'Bearer ' . $this->sessionToken;
             }
 
-            $response = $this->httpClient->get("/v2/subtitles/{$subtitleId}/download", [
+            $response = $this->httpClient->get("subtitles/{$subtitleId}/download", [
                 'headers' => $headers,
                 'query' => [
                     'format' => $this->format,
