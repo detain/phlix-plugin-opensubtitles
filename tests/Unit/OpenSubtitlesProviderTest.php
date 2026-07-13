@@ -315,8 +315,14 @@ final class OpenSubtitlesProviderTest extends TestCase
      * way to feed a real search result into {@see OpenSubtitlesProvider::download()}.
      * The real API nests file info under `attributes.files` (an array), each with
      * `file_id`, `file_name`, `cd_number`; `imdb_id` lives under
-     * `attributes.feature_details.imdb_id`; and the JSON:API resource `id` is a
-     * STRING, not an int.
+     * `attributes.feature_details.imdb_id` as a JSON NUMBER (not a string — see
+     * {@see OpenSubtitlesProvider::normalizeImdbId()}); and the JSON:API resource
+     * `id` is a STRING, not an int.
+     *
+     * The `imdb_id` fixture below is deliberately the bare int `1234567` (the real
+     * API shape), NOT the string `"tt1234567"` — encoding the fixture as a string
+     * previously let `is_string($featureDetails['imdb_id'])` pass against a fake
+     * shape while silently returning `null` against every real response.
      */
     public function test_search_by_imdb_id_parses_attributes_files_array_and_surfaces_file_id(): void
     {
@@ -333,7 +339,7 @@ final class OpenSubtitlesProviderTest extends TestCase
                             'language' => 'en',
                             'download_count' => 5000,
                             'feature_details' => [
-                                'imdb_id' => 'tt1234567',
+                                'imdb_id' => 1234567,
                             ],
                             'files' => [
                                 [
@@ -366,6 +372,93 @@ final class OpenSubtitlesProviderTest extends TestCase
     }
 
     /**
+     * Dedicated regression test for the `imdb_id` TYPE bug (as opposed to the
+     * path bug covered above): the real API returns `feature_details.imdb_id` as
+     * a JSON number, e.g. `133093` for `tt0133093` (leading zeros are not
+     * representable in a JSON number, so the raw value drops them). A prior fix
+     * corrected the JSON path but kept an `is_string()` check, so `imdb_id` stayed
+     * `null` for every real (numeric) response even after that fix. This asserts
+     * the numeric value is both extracted AND re-normalized to the `tt`-prefixed,
+     * zero-padded string convention used elsewhere in Phlix (see
+     * `phlix-server`'s `ImdbLookup`/`TmdbProvider`/`MovieMetadataResolver`).
+     */
+    public function test_search_by_imdb_id_normalizes_numeric_imdb_id_with_zero_padding(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $history = [];
+        $this->installMockHttpClient($provider, [
+            new Response(200, [], (string) json_encode([
+                'data' => [
+                    [
+                        'id' => '1',
+                        'attributes' => [
+                            'language' => 'en',
+                            'download_count' => 1,
+                            'feature_details' => ['imdb_id' => 133093],
+                            'files' => [
+                                ['file_id' => 1, 'cd_number' => 1, 'file_name' => 'a.srt'],
+                            ],
+                        ],
+                    ],
+                ],
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $results = $provider->searchByImdbId('tt0133093');
+
+        $this->assertCount(1, $results);
+        $this->assertSame('tt0133093', $results[0]['imdb_id']);
+    }
+
+    /**
+     * When `feature_details.imdb_id` is absent, or is a shape that isn't a real
+     * IMDB id at all (a non-numeric string, `null`, or a JSON bool), `imdb_id`
+     * must resolve to `null` rather than throwing or fabricating a placeholder.
+     */
+    public function test_search_by_imdb_id_returns_null_imdb_id_when_missing_or_invalid(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $history = [];
+        $this->installMockHttpClient($provider, [
+            new Response(200, [], (string) json_encode([
+                'data' => [
+                    [
+                        'id' => '1',
+                        'attributes' => [
+                            'language' => 'en',
+                            'download_count' => 1,
+                            'files' => [
+                                ['file_id' => 1, 'cd_number' => 1, 'file_name' => 'a.srt'],
+                            ],
+                        ],
+                    ],
+                    [
+                        'id' => '2',
+                        'attributes' => [
+                            'language' => 'en',
+                            'download_count' => 1,
+                            'feature_details' => ['imdb_id' => 'not-a-number'],
+                            'files' => [
+                                ['file_id' => 2, 'cd_number' => 1, 'file_name' => 'b.srt'],
+                            ],
+                        ],
+                    ],
+                ],
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $results = $provider->searchByImdbId('tt1234567');
+
+        $this->assertCount(2, $results);
+        $this->assertNull($results[0]['imdb_id']);
+        $this->assertNull($results[1]['imdb_id']);
+    }
+
+    /**
      * A single subtitle listing can carry multiple files (e.g. one file per CD
      * for old multi-CD releases). Naively taking `files[0]` and discarding the
      * rest would silently misrepresent the release as a single-file download —
@@ -385,7 +478,7 @@ final class OpenSubtitlesProviderTest extends TestCase
                         'attributes' => [
                             'language' => 'en',
                             'download_count' => 200,
-                            'feature_details' => ['imdb_id' => 'tt1234567'],
+                            'feature_details' => ['imdb_id' => 1234567],
                             'files' => [
                                 [
                                     'file_id' => 111111,

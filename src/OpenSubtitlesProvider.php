@@ -616,7 +616,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *   "attributes": {
      *     "language": "en",
      *     "download_count": 5000,
-     *     "feature_details": { "imdb_id": "tt1234567" },
+     *     "feature_details": { "imdb_id": 1234567 },
      *     "files": [
      *       { "file_id": 998877, "cd_number": 1, "file_name": "Movie.Name.2019.srt" }
      *     ]
@@ -640,6 +640,17 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *    against the real API, so every result's `id` silently collapsed to `0`.
      *    `imdb_id` is nested under `attributes.feature_details.imdb_id`, not
      *    `attributes.imdb_id` directly — the old flat read always saw `null`.
+     * 4. `feature_details.imdb_id` is a JSON NUMBER (confirmed against the official
+     *    OpenSubtitles OpenAPI spec's `"imdb_id": {"type": "number"}`, the
+     *    `odwrtw/opensubtitles` Go client's `FeatureDetails.ImdbID int`, and the
+     *    official `opensubtitles/vlsub-opensubtitles-com` VLC plugin, which wraps it
+     *    in `tostring(details.imdb_id or "")` before display) — never a string. The
+     *    path fix in point 3 above still used `is_string()`, so `imdb_id` remained
+     *    `null` for every real response even after the path was corrected. See
+     *    {@see normalizeImdbId()}, which accepts the real numeric shape and
+     *    normalizes it to this codebase's `tt`-prefixed string convention (the shape
+     *    used everywhere else in phlix-server, e.g. `ImdbLookup`, `TmdbProvider`,
+     *    `MovieMetadataResolver`).
      *
      * There is no per-subtitle or per-file `format` attribute in the real API at
      * all (verified absent from every reference client above); the only reliable
@@ -714,7 +725,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             $format = self::formatFromFilename($primaryFile['file_name']) ?? $preferredFormat;
             $languageCode = is_string($attributes['language'] ?? null) ? $attributes['language'] : 'en';
             $downloadCount = is_int($attributes['download_count'] ?? null) ? $attributes['download_count'] : 0;
-            $imdbId = is_string($featureDetails['imdb_id'] ?? null) ? $featureDetails['imdb_id'] : null;
+            $imdbId = self::normalizeImdbId($featureDetails['imdb_id'] ?? null);
 
             $idRaw = $subtitle['id'] ?? null;
             $subtitleId = match (true) {
@@ -765,6 +776,51 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $extension = pathinfo($filename, PATHINFO_EXTENSION);
 
         return $extension !== '' ? strtolower($extension) : null;
+    }
+
+    /**
+     * Normalize a raw `feature_details.imdb_id` value to this codebase's
+     * `tt`-prefixed IMDB id string convention.
+     *
+     * The real OpenSubtitles v1 API returns `imdb_id` as a JSON NUMBER (e.g.
+     * `1234567`), confirmed against the official OpenAPI spec
+     * (`"imdb_id": {"type": "number"}`), the `odwrtw/opensubtitles` Go client
+     * (`FeatureDetails.ImdbID int`), and the official
+     * `opensubtitles/vlsub-opensubtitles-com` VLC plugin (which itself has to
+     * `tostring()` the value before display). A prior fix corrected the JSON
+     * *path* to `feature_details.imdb_id` but kept an `is_string()` check, so
+     * the field silently stayed `null` for every real (numeric) response.
+     *
+     * The bare number has no `tt` prefix and drops any leading zeros (e.g.
+     * `133093` for `tt0133093`), so it is re-padded to at least 7 digits and
+     * prefixed here to match the `tt\d{7,}` shape used everywhere else in
+     * Phlix (see `phlix-server`'s `ImdbLookup`, `TmdbProvider`,
+     * `MovieMetadataResolver`, etc. — all represent IMDB ids as a `tt`-prefixed
+     * string, never a bare number).
+     *
+     * A numeric string is also accepted, in case some API responses vary from
+     * the documented number type; anything else (missing, non-numeric, zero,
+     * or negative) is treated as "no IMDB id".
+     *
+     * @param mixed $rawImdbId Raw `feature_details.imdb_id` value from the API.
+     *
+     * @return string|null `tt`-prefixed IMDB id (e.g. "tt1234567"), or null.
+     *
+     * @since 0.3.1
+     */
+    private static function normalizeImdbId(mixed $rawImdbId): ?string
+    {
+        $number = match (true) {
+            is_int($rawImdbId) => $rawImdbId,
+            is_string($rawImdbId) && ctype_digit($rawImdbId) => (int) $rawImdbId,
+            default => null,
+        };
+
+        if ($number === null || $number <= 0) {
+            return null;
+        }
+
+        return 'tt' . str_pad((string) $number, 7, '0', STR_PAD_LEFT);
     }
 
     /**
