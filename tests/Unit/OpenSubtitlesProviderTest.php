@@ -70,6 +70,54 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertSame('srt', $provider->getFormat());
     }
 
+    /**
+     * Regression test for a stale hardcoded `User-Agent`: the header used to
+     * be the literal `Phlix-Plugin-OpenSubtitles/0.1.0` no matter what
+     * `plugin.json` actually said — it was never bumped across several real
+     * version bumps (0.2.0, then 0.3.x), so it drifted further out of sync
+     * with every release. The header must instead be derived from
+     * `plugin.json`'s `version` field at runtime, so this asserts it matches
+     * whatever the manifest currently says rather than embedding a second
+     * copy of the version number as a literal in this test (which would just
+     * go stale in the same way).
+     */
+    public function test_http_client_user_agent_derives_from_plugin_json_version(): void
+    {
+        $manifestPath = dirname(__DIR__, 2) . '/plugin.json';
+        /** @var array<string, mixed> $manifest */
+        $manifest = json_decode((string) file_get_contents($manifestPath), true);
+        $expectedVersion = $manifest['version'];
+        $this->assertIsString($expectedVersion);
+        $this->assertNotSame('', $expectedVersion);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $property = new \ReflectionProperty(OpenSubtitlesProvider::class, 'httpClient');
+        $property->setAccessible(true);
+        /** @var Client $client */
+        $client = $property->getValue($provider);
+
+        /** @var array<string, string> $headers */
+        $headers = $client->getConfig('headers');
+
+        $this->assertSame('Phlix-Plugin-OpenSubtitles/' . $expectedVersion, $headers['User-Agent']);
+    }
+
+    public function test_http_client_user_agent_is_not_the_old_stale_hardcoded_literal(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $property = new \ReflectionProperty(OpenSubtitlesProvider::class, 'httpClient');
+        $property->setAccessible(true);
+        /** @var Client $client */
+        $client = $property->getValue($provider);
+
+        /** @var array<string, string> $headers */
+        $headers = $client->getConfig('headers');
+
+        $this->assertNotSame('Phlix-Plugin-OpenSubtitles/0.1.0', $headers['User-Agent']);
+    }
+
     public function test_configure_applies_persisted_settings(): void
     {
         $provider = new OpenSubtitlesProvider();

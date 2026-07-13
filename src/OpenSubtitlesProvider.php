@@ -16,9 +16,11 @@ use GuzzleHttp\Exception\GuzzleException;
 use GuzzleHttp\Exception\RequestException;
 use Phlix\Shared\Plugin\ConfigurableInterface;
 use Phlix\Shared\Plugin\LifecycleInterface;
+use Phlix\Shared\Plugin\Manifest;
 use Psr\Container\ContainerInterface;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
+use RuntimeException;
 
 /**
  * OpenSubtitles subtitle provider for Phlix.
@@ -119,6 +121,13 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     private bool $enabled = false;
 
     /**
+     * Cached result of {@see self::pluginVersion()}, populated lazily on first
+     * use (shared across every instance in the process — `plugin.json` cannot
+     * change without a redeploy, so re-reading it per-instance is pointless).
+     */
+    private static ?string $cachedPluginVersion = null;
+
+    /**
      * @param string      $apiKey   OpenSubtitles API key.
      * @param string|null $username OpenSubtitles username (optional).
      * @param string|null $password OpenSubtitles password (optional).
@@ -184,10 +193,69 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             'timeout' => 30,
             'headers' => [
                 'Api-Key' => $this->apiKey,
-                'User-Agent' => 'Phlix-Plugin-OpenSubtitles/0.1.0',
+                'User-Agent' => 'Phlix-Plugin-OpenSubtitles/' . self::pluginVersion(),
                 'Accept' => 'application/json',
             ],
         ]);
+    }
+
+    /**
+     * This plugin's own version, read from its `plugin.json` manifest.
+     *
+     * The `User-Agent` header used to carry a hardcoded literal
+     * (`Phlix-Plugin-OpenSubtitles/0.1.0`) that was never updated across
+     * several real version bumps (it still said `0.1.0` once the manifest
+     * had moved on to `0.2.0`, then `0.3.x`) — deriving it from the manifest
+     * here means it can never go stale like that again.
+     *
+     * `plugin.json` lives at this package's root, one directory above `src/`
+     * — true both for a git checkout of this repo and for a Composer install
+     * under `vendor/detain/phlix-plugin-opensubtitles/` (see phlix-server's
+     * `PluginLoader`, which expects the manifest there) — so the path is
+     * resolved relative to this class's own file rather than any host
+     * working directory. Parsing itself is delegated to
+     * {@see Manifest::fromJson()} (from `detain/phlix-shared`, already a
+     * dependency of this plugin) rather than hand-rolling `json_decode()`
+     * here.
+     *
+     * The result is cached for the lifetime of the process: {@see
+     * self::rebuildHttpClient()} is called from both the constructor and
+     * {@see self::configure()}, so without caching every settings change
+     * would re-read and re-parse the manifest file for no benefit (the
+     * version cannot change without a redeploy).
+     *
+     * @return string The manifest's `version` field, or `'unknown'` if the
+     *         file is missing, unreadable, or malformed — this must never
+     *         throw, since it runs from inside the `Client` constructor.
+     *
+     * @since 0.3.2
+     */
+    private static function pluginVersion(): string
+    {
+        if (self::$cachedPluginVersion !== null) {
+            return self::$cachedPluginVersion;
+        }
+
+        $manifestPath = dirname(__DIR__) . '/plugin.json';
+        $version = 'unknown';
+
+        if (is_readable($manifestPath)) {
+            $contents = file_get_contents($manifestPath);
+
+            if ($contents !== false) {
+                try {
+                    $manifest = Manifest::fromJson($contents);
+
+                    if ($manifest->version !== '') {
+                        $version = $manifest->version;
+                    }
+                } catch (RuntimeException) {
+                    // Malformed manifest — fall through to the 'unknown' sentinel.
+                }
+            }
+        }
+
+        return self::$cachedPluginVersion = $version;
     }
 
     /**
