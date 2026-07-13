@@ -308,6 +308,92 @@ final class OpenSubtitlesProviderTest extends TestCase
     }
 
     /**
+     * Regression test for the download API-shape bug: `download()` used to
+     * `GET subtitles/{id}/download` expecting an inline base64 `content`
+     * field in a single response. The real OpenSubtitles v1 API is a
+     * two-step flow — `POST download` with a `file_id` body returns a
+     * temporary `link` (plus quota accounting), and the actual subtitle
+     * bytes must then be fetched with a second `GET` against that link.
+     * This asserts both outgoing requests' shape AND that the final
+     * returned content is the fetched file bytes, not the JSON envelope
+     * from the first call.
+     */
+    public function test_download_posts_file_id_and_fetches_content_from_link(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY, format: 'srt');
+
+        $history = [];
+        $this->installMockHttpClient($provider, [
+            new Response(200, [], (string) json_encode([
+                'link' => 'https://dl.opensubtitles.org/download/src/upload/12345.srt',
+                'file_name' => 'Movie.Name.2019.srt',
+                'requests' => 1,
+                'remaining' => 4,
+                'message' => 'Your quota will be renewed in 2 hours and 47 minutes',
+                'reset_time' => '2 hours and 47 minutes',
+                'reset_time_utc' => '2026-07-13T23:59:59Z',
+            ])),
+            new Response(200, [], "1\n00:00:01,000 --> 00:00:02,000\nHello world.\n"),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $download = $provider->download(998877);
+
+        $this->assertCount(2, $history);
+
+        $linkRequest = $history[0]['request'];
+        $this->assertSame('POST', $linkRequest->getMethod());
+        $this->assertSame(
+            'https://api.opensubtitles.com/api/v1/download',
+            (string) $linkRequest->getUri(),
+        );
+        /** @var array<string, mixed> */
+        $requestBody = json_decode((string) $linkRequest->getBody(), true);
+        $this->assertSame(['file_id' => 998877, 'sub_format' => 'srt'], $requestBody);
+
+        $contentRequest = $history[1]['request'];
+        $this->assertSame('GET', $contentRequest->getMethod());
+        $this->assertSame(
+            'https://dl.opensubtitles.org/download/src/upload/12345.srt',
+            (string) $contentRequest->getUri(),
+        );
+
+        $this->assertSame(
+            "1\n00:00:01,000 --> 00:00:02,000\nHello world.\n",
+            $download->content,
+        );
+        $this->assertSame('srt', $download->format);
+        $this->assertSame('Movie.Name.2019.srt', $download->fileName);
+        $this->assertSame(1, $download->requestsUsed);
+        $this->assertSame(4, $download->downloadsRemaining);
+        $this->assertSame('Your quota will be renewed in 2 hours and 47 minutes', $download->quotaMessage);
+        $this->assertSame('2 hours and 47 minutes', $download->resetTime);
+        $this->assertSame('2026-07-13T23:59:59Z', $download->resetTimeUtc);
+    }
+
+    /**
+     * When the first-step response is missing `link` there is nothing to
+     * fetch content from — this must fail loudly rather than return an
+     * empty/placeholder subtitle.
+     */
+    public function test_download_throws_when_response_is_missing_link(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $history = [];
+        $this->installMockHttpClient($provider, [
+            new Response(200, [], (string) json_encode(['file_name' => 'movie.srt'])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessage('did not include a download link');
+
+        $provider->download(998877);
+    }
+
+    /**
      * Replace the provider's internal Guzzle client with one backed by a
      * {@see MockHandler} (same `base_uri` as production), wiring Guzzle's
      * history middleware to append `['request' => ..., 'response' => ...]`

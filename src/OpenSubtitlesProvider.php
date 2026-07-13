@@ -451,15 +451,30 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     /**
      * Download a subtitle file.
      *
-     * @param int $subtitleId OpenSubtitles subtitle ID.
+     * The real OpenSubtitles v1 REST API is a two-step flow — it does NOT return
+     * subtitle content directly:
+     *
+     * 1. `POST download` with a `file_id` JSON body returns a JSON envelope
+     *    containing a temporary `link` URL plus download-quota accounting
+     *    (`requests`, `remaining`, `message`, `reset_time`, `reset_time_utc`).
+     *    This call itself counts against the account's download quota, so it
+     *    must not be retried speculatively.
+     * 2. The actual subtitle file bytes are then fetched with a plain `GET`
+     *    against that `link` URL (a different host, not `API_BASE`).
+     *
+     * @see https://opensubtitles.stoplight.io/docs/opensubtitles-api/6be7f6ae2d918-download
+     *
+     * @param int $fileId OpenSubtitles file ID (`attributes.files[].file_id` from a
+     *        `/subtitles` search result — NOT the top-level subtitle `id`).
      *
      * @return SubtitleDownload
      *
-     * @throws OpenSubtitlesException When the download fails.
+     * @throws OpenSubtitlesException When the download fails, or the API response
+     *         is missing the `link` needed to fetch the file content.
      *
      * @since 0.1.0
      */
-    public function download(int $subtitleId): SubtitleDownload
+    public function download(int $fileId): SubtitleDownload
     {
         $this->ensureEnabled();
 
@@ -472,31 +487,42 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
                 $headers['Authorization'] = 'Bearer ' . $this->sessionToken;
             }
 
-            $response = $this->httpClient->get("subtitles/{$subtitleId}/download", [
+            $body = ['file_id' => $fileId];
+            if ($this->format !== '') {
+                $body['sub_format'] = $this->format;
+            }
+
+            $linkResponse = $this->httpClient->post('download', [
                 'headers' => $headers,
-                'query' => [
-                    'format' => $this->format,
-                ],
+                'json' => $body,
             ]);
 
             /** @var array<string, mixed> */
-            $data = json_decode((string) $response->getBody(), true);
+            $data = json_decode((string) $linkResponse->getBody(), true);
 
-            $content = '';
-            if (isset($data['content']) && is_string($data['content'])) {
-                $decoded = base64_decode($data['content'], true);
-                $content = is_string($decoded) ? $decoded : '';
+            $link = is_string($data['link'] ?? null) && $data['link'] !== '' ? $data['link'] : null;
+            if ($link === null) {
+                throw new OpenSubtitlesException(
+                    'OpenSubtitles download response did not include a download link',
+                );
             }
 
-            $format = is_string($data['format'] ?? null) ? $data['format'] : $this->format;
             $fileName = is_string($data['file_name'] ?? null)
                 ? $data['file_name']
                 : "subtitle.{$this->format}";
 
+            $contentResponse = $this->httpClient->get($link);
+            $content = (string) $contentResponse->getBody();
+
             return new SubtitleDownload(
                 content: $content,
-                format: $format,
+                format: $this->format,
                 fileName: $fileName,
+                requestsUsed: is_int($data['requests'] ?? null) ? $data['requests'] : null,
+                downloadsRemaining: is_int($data['remaining'] ?? null) ? $data['remaining'] : null,
+                quotaMessage: is_string($data['message'] ?? null) ? $data['message'] : null,
+                resetTime: is_string($data['reset_time'] ?? null) ? $data['reset_time'] : null,
+                resetTimeUtc: is_string($data['reset_time_utc'] ?? null) ? $data['reset_time_utc'] : null,
             );
         } catch (GuzzleException $e) {
             $this->logger->error('OpenSubtitles download failed: ' . $e->getMessage());
