@@ -13,6 +13,7 @@ namespace Phlix\PluginOpenSubtitles;
 
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
+use GuzzleHttp\Exception\RequestException;
 use Phlix\Shared\Plugin\ConfigurableInterface;
 use Phlix\Shared\Plugin\LifecycleInterface;
 use Psr\Container\ContainerInterface;
@@ -492,6 +493,25 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * 2. The actual subtitle file bytes are then fetched with a plain `GET`
      *    against that `link` URL (a different host, not `API_BASE`).
      *
+     * Quota exhaustion is surfaced distinctly (as a
+     * {@see OpenSubtitlesQuotaExceededException}, a subtype of
+     * {@see OpenSubtitlesException} so existing catch sites keep working)
+     * rather than as a generic failure, in two ways — confirmed against real
+     * reports (e.g. https://github.com/morpheus65535/bazarr/issues/2153) since
+     * the OpenAPI spec itself does not document an explicit quota-exceeded
+     * error shape:
+     *
+     * - The step-1 `POST` can itself fail with a 4xx status whose JSON body is
+     *   just `{"message": "You have downloaded your allowed N subtitles for
+     *   24h. Your quota will be renewed in ..."}` — this is the shape actually
+     *   observed in production. {@see mapDownloadLinkFailure()} inspects that
+     *   body and re-throws a quota-specific exception when the message text
+     *   looks like a quota notice, rather than the generic
+     *   `'Download failed: ' . $e->getMessage()` every other failure gets.
+     * - Defensively, if the step-1 call instead returns HTTP 200 with
+     *   `remaining: 0` and no `link` at all, that is also treated as quota
+     *   exhaustion rather than the generic "missing download link" error.
+     *
      * @see https://opensubtitles.stoplight.io/docs/opensubtitles-api/6be7f6ae2d918-download
      *
      * @param int $fileId OpenSubtitles file ID (`attributes.files[].file_id` from a
@@ -499,8 +519,10 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *
      * @return SubtitleDownload
      *
-     * @throws OpenSubtitlesException When the download fails, or the API response
-     *         is missing the `link` needed to fetch the file content.
+     * @throws OpenSubtitlesQuotaExceededException When the account's download quota
+     *         is exhausted.
+     * @throws OpenSubtitlesException When the download otherwise fails, or the API
+     *         response is missing the `link` needed to fetch the file content.
      *
      * @since 0.1.0
      */
@@ -508,56 +530,164 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     {
         $this->ensureEnabled();
 
+        $headers = [
+            'Accept' => 'application/json',
+        ];
+
+        if ($this->sessionToken !== null) {
+            $headers['Authorization'] = 'Bearer ' . $this->sessionToken;
+        }
+
+        $body = ['file_id' => $fileId];
+        if ($this->format !== '') {
+            $body['sub_format'] = $this->format;
+        }
+
         try {
-            $headers = [
-                'Accept' => 'application/json',
-            ];
-
-            if ($this->sessionToken !== null) {
-                $headers['Authorization'] = 'Bearer ' . $this->sessionToken;
-            }
-
-            $body = ['file_id' => $fileId];
-            if ($this->format !== '') {
-                $body['sub_format'] = $this->format;
-            }
-
             $linkResponse = $this->httpClient->post('download', [
                 'headers' => $headers,
                 'json' => $body,
             ]);
+        } catch (GuzzleException $e) {
+            throw $this->mapDownloadLinkFailure($e);
+        }
 
-            /** @var array<string, mixed> */
-            $data = json_decode((string) $linkResponse->getBody(), true);
+        /** @var array<string, mixed> */
+        $data = json_decode((string) $linkResponse->getBody(), true);
 
-            $link = is_string($data['link'] ?? null) && $data['link'] !== '' ? $data['link'] : null;
-            if ($link === null) {
-                throw new OpenSubtitlesException(
-                    'OpenSubtitles download response did not include a download link',
-                );
+        $remaining = is_int($data['remaining'] ?? null) ? $data['remaining'] : null;
+        $link = is_string($data['link'] ?? null) && $data['link'] !== '' ? $data['link'] : null;
+
+        if ($link === null) {
+            if ($remaining === 0) {
+                throw self::quotaExceededException($data);
             }
 
-            $fileName = is_string($data['file_name'] ?? null)
-                ? $data['file_name']
-                : "subtitle.{$this->format}";
-
-            $contentResponse = $this->httpClient->get($link);
-            $content = (string) $contentResponse->getBody();
-
-            return new SubtitleDownload(
-                content: $content,
-                format: $this->format,
-                fileName: $fileName,
-                requestsUsed: is_int($data['requests'] ?? null) ? $data['requests'] : null,
-                downloadsRemaining: is_int($data['remaining'] ?? null) ? $data['remaining'] : null,
-                quotaMessage: is_string($data['message'] ?? null) ? $data['message'] : null,
-                resetTime: is_string($data['reset_time'] ?? null) ? $data['reset_time'] : null,
-                resetTimeUtc: is_string($data['reset_time_utc'] ?? null) ? $data['reset_time_utc'] : null,
+            throw new OpenSubtitlesException(
+                'OpenSubtitles download response did not include a download link',
             );
+        }
+
+        $fileName = is_string($data['file_name'] ?? null)
+            ? $data['file_name']
+            : "subtitle.{$this->format}";
+
+        try {
+            $contentResponse = $this->httpClient->get($link);
         } catch (GuzzleException $e) {
             $this->logger->error('OpenSubtitles download failed: ' . $e->getMessage());
             throw new OpenSubtitlesException('Download failed: ' . $e->getMessage(), 0, $e);
         }
+
+        $content = (string) $contentResponse->getBody();
+
+        return new SubtitleDownload(
+            content: $content,
+            format: $this->format,
+            fileName: $fileName,
+            requestsUsed: is_int($data['requests'] ?? null) ? $data['requests'] : null,
+            downloadsRemaining: $remaining,
+            quotaMessage: is_string($data['message'] ?? null) ? $data['message'] : null,
+            resetTime: is_string($data['reset_time'] ?? null) ? $data['reset_time'] : null,
+            resetTimeUtc: is_string($data['reset_time_utc'] ?? null) ? $data['reset_time_utc'] : null,
+        );
+    }
+
+    /**
+     * Translate a failure from the step-1 `POST download` call into either a
+     * quota-specific exception or the generic download-failure exception.
+     *
+     * The real API's documented quota-exceeded shape (see {@see download()}'s
+     * docblock) is an HTTP 4xx response whose JSON body is just a `message`
+     * string — there is no dedicated error code to switch on, so the message
+     * text itself is inspected via {@see looksLikeQuotaMessage()}.
+     *
+     * @param GuzzleException $e The exception thrown by the step-1 POST call.
+     *
+     * @return OpenSubtitlesException Ready to be thrown by the caller.
+     *
+     * @since 0.3.2
+     */
+    private function mapDownloadLinkFailure(GuzzleException $e): OpenSubtitlesException
+    {
+        $response = $e instanceof RequestException ? $e->getResponse() : null;
+
+        if ($response !== null) {
+            $statusCode = $response->getStatusCode();
+
+            if ($statusCode >= 400 && $statusCode < 500) {
+                $decoded = json_decode((string) $response->getBody(), true);
+                $responseData = is_array($decoded) ? $decoded : [];
+                $message = is_string($responseData['message'] ?? null) ? $responseData['message'] : null;
+
+                if ($message !== null && self::looksLikeQuotaMessage($message)) {
+                    $this->logger->warning('OpenSubtitles download quota exceeded: ' . $message);
+
+                    return new OpenSubtitlesQuotaExceededException(
+                        $message,
+                        resetTime: is_string($responseData['reset_time'] ?? null)
+                            ? $responseData['reset_time']
+                            : null,
+                        resetTimeUtc: is_string($responseData['reset_time_utc'] ?? null)
+                            ? $responseData['reset_time_utc']
+                            : null,
+                    );
+                }
+            }
+        }
+
+        $this->logger->error('OpenSubtitles download failed: ' . $e->getMessage());
+
+        return new OpenSubtitlesException('Download failed: ' . $e->getMessage(), 0, $e);
+    }
+
+    /**
+     * Build a quota-exceeded exception from a step-1 `POST download` response
+     * body that reported `remaining: 0` with no `link`.
+     *
+     * @param array<string, mixed> $data Decoded step-1 response body.
+     *
+     * @return OpenSubtitlesQuotaExceededException
+     *
+     * @since 0.3.2
+     */
+    private static function quotaExceededException(array $data): OpenSubtitlesQuotaExceededException
+    {
+        $message = is_string($data['message'] ?? null) && $data['message'] !== ''
+            ? $data['message']
+            : 'OpenSubtitles download quota exceeded: no downloads remaining';
+
+        return new OpenSubtitlesQuotaExceededException(
+            $message,
+            resetTime: is_string($data['reset_time'] ?? null) ? $data['reset_time'] : null,
+            resetTimeUtc: is_string($data['reset_time_utc'] ?? null) ? $data['reset_time_utc'] : null,
+        );
+    }
+
+    /**
+     * Heuristically decide whether an API error message describes download
+     * quota exhaustion.
+     *
+     * The OpenSubtitles v1 API has no dedicated error code for this (see
+     * {@see download()}'s docblock), only a free-text `message` — observed in
+     * production as e.g. "You have downloaded your allowed 20 subtitles for
+     * 24h.Your quota will be renewed in ...". Matching loosely on
+     * "quota"/"download limit" (mirroring the wording the
+     * `dusking/opensubtitles-com` reference client itself uses: "Download
+     * limit reached") avoids mis-detecting an unrelated 4xx (e.g. a stale
+     * token) as quota exhaustion while still catching the real message.
+     *
+     * @param string $message API-provided error message text.
+     *
+     * @return bool True if the message looks like a quota-exceeded notice.
+     *
+     * @since 0.3.2
+     */
+    private static function looksLikeQuotaMessage(string $message): bool
+    {
+        return stripos($message, 'quota') !== false
+            || stripos($message, 'download limit') !== false
+            || (stripos($message, 'allowed') !== false && stripos($message, 'download') !== false);
     }
 
     /**

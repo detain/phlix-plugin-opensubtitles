@@ -18,6 +18,7 @@ use GuzzleHttp\Middleware;
 use GuzzleHttp\Psr7\Response;
 use Phlix\PluginOpenSubtitles\OpenSubtitlesException;
 use Phlix\PluginOpenSubtitles\OpenSubtitlesProvider;
+use Phlix\PluginOpenSubtitles\OpenSubtitlesQuotaExceededException;
 use Phlix\PluginOpenSubtitles\SubtitleDownload;
 use PHPUnit\Framework\TestCase;
 use Psr\Container\ContainerInterface;
@@ -731,6 +732,157 @@ final class OpenSubtitlesProviderTest extends TestCase
 
         $this->expectException(OpenSubtitlesException::class);
         $this->expectExceptionMessage('did not include a download link');
+
+        $provider->download(998877);
+    }
+
+    /**
+     * Defensive branch: if the step-1 `POST download` response is HTTP 200 but
+     * reports `remaining: 0` with no `link`, that is quota exhaustion (there is
+     * nothing else it could mean — the account simply has no downloads left),
+     * so it must surface as {@see OpenSubtitlesQuotaExceededException} rather
+     * than the generic "did not include a download link" message.
+     */
+    public function test_download_throws_quota_exceeded_when_no_link_and_zero_remaining(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $history = [];
+        $this->installMockHttpClient($provider, [
+            new Response(200, [], (string) json_encode([
+                'remaining' => 0,
+                'message' => 'You have downloaded your allowed 20 subtitles for 24h.'
+                    . 'Your quota will be renewed in 00 hours and 27 minutes (2023-05-24 23:59:59 UTC) ',
+                'reset_time_utc' => '2023-05-24T23:59:59Z',
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->download(998877);
+            $this->fail('Expected OpenSubtitlesQuotaExceededException to be thrown.');
+        } catch (OpenSubtitlesQuotaExceededException $e) {
+            $this->assertStringContainsString('allowed 20 subtitles for 24h', $e->getMessage());
+            $this->assertSame('2023-05-24T23:59:59Z', $e->resetTimeUtc);
+        }
+    }
+
+    /**
+     * Regression test for the download-quota-exhaustion UX gap: the real
+     * OpenSubtitles v1 API has no dedicated error shape for this — per
+     * https://github.com/morpheus65535/bazarr/issues/2153, an exhausted
+     * account's `POST download` call fails with an HTTP 4xx status whose body
+     * is just `{"message": "You have downloaded your allowed N subtitles for
+     * 24h...."}`. Before this fix that was only ever caught generically via
+     * `GuzzleException` and turned into `'Download failed: ' . $e->getMessage()`
+     * — this asserts it is now recognized and re-thrown as a distinctly typed
+     * {@see OpenSubtitlesQuotaExceededException} carrying the API's own
+     * message, so a caller (e.g. a multi-provider subtitle-fetch orchestrator)
+     * can react to quota exhaustion specifically instead of string-matching a
+     * generic error.
+     */
+    public function test_download_throws_quota_exceeded_when_post_returns_4xx_quota_message(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $history = [];
+        $this->installMockHttpClient($provider, [
+            new Response(406, [], (string) json_encode([
+                'message' => 'You have downloaded your allowed 20 subtitles for 24h.'
+                    . 'Your quota will be renewed in 00 hours and 27 minutes (2023-05-24 23:59:59 UTC) ',
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->download(998877);
+            $this->fail('Expected OpenSubtitlesQuotaExceededException to be thrown.');
+        } catch (OpenSubtitlesQuotaExceededException $e) {
+            $this->assertStringContainsString('allowed 20 subtitles for 24h', $e->getMessage());
+        }
+    }
+
+    /**
+     * The quota-message heuristic must not fire for an unrelated 4xx failure
+     * (e.g. an expired/invalid session token) — that must still surface as the
+     * generic {@see OpenSubtitlesException}, not be misrepresented as quota
+     * exhaustion.
+     */
+    public function test_download_does_not_report_quota_exceeded_for_unrelated_4xx(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $history = [];
+        $this->installMockHttpClient($provider, [
+            new Response(401, [], (string) json_encode(['message' => 'Unauthorized'])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessageMatches('/Download failed/');
+
+        try {
+            $provider->download(998877);
+        } catch (OpenSubtitlesException $e) {
+            $this->assertNotInstanceOf(OpenSubtitlesQuotaExceededException::class, $e);
+
+            throw $e;
+        }
+    }
+
+    /**
+     * When the step-1 response reports `remaining: 0` with no `link` but ALSO
+     * no `message` (the API's `message` field is documented as optional quota
+     * accounting, not always present), a clear default message must still be
+     * used rather than an empty/unhelpful one.
+     */
+    public function test_download_quota_exceeded_uses_fallback_message_when_api_omits_message(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $history = [];
+        $this->installMockHttpClient($provider, [
+            new Response(200, [], (string) json_encode(['remaining' => 0])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->download(998877);
+            $this->fail('Expected OpenSubtitlesQuotaExceededException to be thrown.');
+        } catch (OpenSubtitlesQuotaExceededException $e) {
+            $this->assertStringContainsString('quota exceeded', $e->getMessage());
+            $this->assertNull($e->resetTime);
+            $this->assertNull($e->resetTimeUtc);
+        }
+    }
+
+    /**
+     * The step-2 content `GET` (against the temporary `link`) is a separate
+     * network call from the step-1 `POST`, and can fail independently (e.g. the
+     * link expired). This must still surface as a clear
+     * {@see OpenSubtitlesException}, not an uncaught Guzzle exception.
+     */
+    public function test_download_throws_when_content_fetch_fails(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $history = [];
+        $this->installMockHttpClient($provider, [
+            new Response(200, [], (string) json_encode([
+                'link' => 'https://dl.opensubtitles.org/download/src/upload/12345.srt',
+                'file_name' => 'movie.srt',
+            ])),
+            new Response(404, [], 'Not Found'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessageMatches('/Download failed/');
 
         $provider->download(998877);
     }
