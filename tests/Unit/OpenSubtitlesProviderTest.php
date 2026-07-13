@@ -308,6 +308,214 @@ final class OpenSubtitlesProviderTest extends TestCase
     }
 
     /**
+     * Regression test for the `filterSubtitles()` shape bug: it used to read
+     * `attributes.file` (singular, never present in the real API), so every
+     * result's `format`/`filename` silently fell back to a fabricated generic
+     * value and no `file_id` was ever surfaced at all — meaning a caller had no
+     * way to feed a real search result into {@see OpenSubtitlesProvider::download()}.
+     * The real API nests file info under `attributes.files` (an array), each with
+     * `file_id`, `file_name`, `cd_number`; `imdb_id` lives under
+     * `attributes.feature_details.imdb_id`; and the JSON:API resource `id` is a
+     * STRING, not an int.
+     */
+    public function test_search_by_imdb_id_parses_attributes_files_array_and_surfaces_file_id(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $history = [];
+        $this->installMockHttpClient($provider, [
+            new Response(200, [], (string) json_encode([
+                'data' => [
+                    [
+                        'id' => '3634077',
+                        'type' => 'subtitle',
+                        'attributes' => [
+                            'language' => 'en',
+                            'download_count' => 5000,
+                            'feature_details' => [
+                                'imdb_id' => 'tt1234567',
+                            ],
+                            'files' => [
+                                [
+                                    'file_id' => 998877,
+                                    'cd_number' => 1,
+                                    'file_name' => 'Movie.Name.2019.srt',
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $results = $provider->searchByImdbId('tt1234567');
+
+        $this->assertCount(1, $results);
+        $this->assertSame('3634077', $results[0]['id']);
+        $this->assertSame('en', $results[0]['language']);
+        $this->assertSame('srt', $results[0]['format']);
+        $this->assertSame(5000, $results[0]['downloads']);
+        $this->assertSame('Movie.Name.2019.srt', $results[0]['filename']);
+        $this->assertSame('tt1234567', $results[0]['imdb_id']);
+        $this->assertSame(998877, $results[0]['file_id']);
+        $this->assertSame(
+            [['file_id' => 998877, 'file_name' => 'Movie.Name.2019.srt', 'cd_number' => 1]],
+            $results[0]['files'],
+        );
+    }
+
+    /**
+     * A single subtitle listing can carry multiple files (e.g. one file per CD
+     * for old multi-CD releases). Naively taking `files[0]` and discarding the
+     * rest would silently misrepresent the release as a single-file download —
+     * this asserts every file survives in the `files` sub-array, not just the
+     * first, while `file_id` still conveniently aliases the first file.
+     */
+    public function test_search_by_imdb_id_preserves_every_file_in_a_multi_cd_release(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $history = [];
+        $this->installMockHttpClient($provider, [
+            new Response(200, [], (string) json_encode([
+                'data' => [
+                    [
+                        'id' => '3634078',
+                        'attributes' => [
+                            'language' => 'en',
+                            'download_count' => 200,
+                            'feature_details' => ['imdb_id' => 'tt1234567'],
+                            'files' => [
+                                [
+                                    'file_id' => 111111,
+                                    'cd_number' => 1,
+                                    'file_name' => 'Movie.Name.2019.CD1.srt',
+                                ],
+                                [
+                                    'file_id' => 111112,
+                                    'cd_number' => 2,
+                                    'file_name' => 'Movie.Name.2019.CD2.srt',
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $results = $provider->searchByImdbId('tt1234567');
+
+        $this->assertCount(1, $results);
+        $this->assertSame(111111, $results[0]['file_id']);
+        $this->assertCount(2, $results[0]['files']);
+        $this->assertSame(
+            ['file_id' => 111111, 'file_name' => 'Movie.Name.2019.CD1.srt', 'cd_number' => 1],
+            $results[0]['files'][0],
+        );
+        $this->assertSame(
+            ['file_id' => 111112, 'file_name' => 'Movie.Name.2019.CD2.srt', 'cd_number' => 2],
+            $results[0]['files'][1],
+        );
+    }
+
+    /**
+     * A subtitle entry with an empty (or missing) `files` array has no `file_id`
+     * to ever pass to {@see OpenSubtitlesProvider::download()}, so it must be
+     * dropped rather than surfaced with a fake sentinel `file_id`. This also
+     * proves the multi-result sort-by-downloads still works once a dead entry
+     * is filtered out from the middle of the list.
+     */
+    public function test_search_by_imdb_id_skips_subtitles_with_no_downloadable_files(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $history = [];
+        $this->installMockHttpClient($provider, [
+            new Response(200, [], (string) json_encode([
+                'data' => [
+                    [
+                        'id' => '1',
+                        'attributes' => ['language' => 'en', 'download_count' => 5000, 'files' => [
+                            ['file_id' => 998877, 'cd_number' => 1, 'file_name' => 'a.srt'],
+                        ]],
+                    ],
+                    [
+                        'id' => '2',
+                        'attributes' => ['language' => 'en', 'download_count' => 99999, 'files' => []],
+                    ],
+                    [
+                        'id' => '3',
+                        'attributes' => ['language' => 'en', 'download_count' => 1, 'files' => [
+                            ['file_id' => 555, 'cd_number' => 1, 'file_name' => 'b.srt'],
+                        ]],
+                    ],
+                ],
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $results = $provider->searchByImdbId('tt1234567');
+
+        $this->assertCount(2, $results);
+        $this->assertSame(['1', '3'], array_column($results, 'id'));
+    }
+
+    /**
+     * End-to-end proof that the fix actually wires search into download: a
+     * `file_id` surfaced by the (now-fixed) search parsing — including a
+     * non-first CD file, not just `files[0]` — round-trips correctly as the
+     * `file_id` body param on the subsequent {@see download()} call.
+     */
+    public function test_search_result_file_id_round_trips_into_download(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY, format: 'srt');
+
+        $history = [];
+        $this->installMockHttpClient($provider, [
+            new Response(200, [], (string) json_encode([
+                'data' => [
+                    [
+                        'id' => '3634078',
+                        'attributes' => [
+                            'language' => 'en',
+                            'download_count' => 200,
+                            'files' => [
+                                ['file_id' => 111111, 'cd_number' => 1, 'file_name' => 'CD1.srt'],
+                                ['file_id' => 111112, 'cd_number' => 2, 'file_name' => 'CD2.srt'],
+                            ],
+                        ],
+                    ],
+                ],
+            ])),
+            new Response(200, [], (string) json_encode([
+                'link' => 'https://dl.opensubtitles.org/download/src/upload/111112.srt',
+                'file_name' => 'CD2.srt',
+            ])),
+            new Response(200, [], "1\n00:00:01,000 --> 00:00:02,000\nCD two.\n"),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $results = $provider->searchByImdbId('tt1234567');
+
+        // Deliberately pick the SECOND CD's file_id, not the top-level convenience
+        // alias, to prove the full `files[]` array — not just `files[0]` — is usable.
+        $secondCdFileId = $results[0]['files'][1]['file_id'];
+        $this->assertSame(111112, $secondCdFileId);
+
+        $download = $provider->download($secondCdFileId);
+
+        $this->assertCount(3, $history);
+        $downloadRequest = $history[1]['request'];
+        /** @var array<string, mixed> */
+        $requestBody = json_decode((string) $downloadRequest->getBody(), true);
+        $this->assertSame(['file_id' => 111112, 'sub_format' => 'srt'], $requestBody);
+        $this->assertSame("1\n00:00:01,000 --> 00:00:02,000\nCD two.\n", $download->content);
+        $this->assertSame('CD2.srt', $download->fileName);
+    }
+
+    /**
      * Regression test for the download API-shape bug: `download()` used to
      * `GET subtitles/{id}/download` expecting an inline base64 `content`
      * field in a single response. The real OpenSubtitles v1 API is a
@@ -369,6 +577,47 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertSame('Your quota will be renewed in 2 hours and 47 minutes', $download->quotaMessage);
         $this->assertSame('2 hours and 47 minutes', $download->resetTime);
         $this->assertSame('2026-07-13T23:59:59Z', $download->resetTimeUtc);
+    }
+
+    /**
+     * Dedicated regression test for the download endpoint's resolved URL, in the
+     * same single-purpose style as {@see test_login_posts_to_the_correct_v1_login_url()}
+     * and {@see test_search_by_imdb_id_requests_the_correct_v1_subtitles_url()}.
+     *
+     * Guzzle's `base_uri` + leading-slash request-path resolution (RFC 3986 §5.3)
+     * previously produced 404s on `login` (see `OpenSubtitlesProvider::API_BASE`'s
+     * docblock) because a leading slash on the request path replaces the entire
+     * `base_uri` path component instead of merging with it. `download()`'s request
+     * path (`'download'`, no leading slash) happens to already be correct as
+     * written, but that fact was previously only ever asserted incidentally inside
+     * a larger, multi-assertion test — nothing would have caught a future
+     * leading-slash regression on this specific path in isolation. This asserts
+     * the fully resolved absolute URI on its own, independent of the rest of the
+     * download flow.
+     */
+    public function test_download_posts_to_the_correct_v1_download_url(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $history = [];
+        $this->installMockHttpClient($provider, [
+            new Response(200, [], (string) json_encode([
+                'link' => 'https://dl.opensubtitles.org/download/src/upload/12345.srt',
+                'file_name' => 'movie.srt',
+            ])),
+            new Response(200, [], 'subtitle body'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $provider->download(998877);
+
+        $this->assertGreaterThanOrEqual(1, count($history));
+        $request = $history[0]['request'];
+        $this->assertSame('POST', $request->getMethod());
+        $this->assertSame(
+            'https://api.opensubtitles.com/api/v1/download',
+            (string) $request->getUri(),
+        );
     }
 
     /**

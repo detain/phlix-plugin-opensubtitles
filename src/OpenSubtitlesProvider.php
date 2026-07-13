@@ -293,7 +293,17 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * @param string $language       Language code (ISO 639-1).
      * @param string $subtitleFormat Preferred format (srt, sub, ass, etc.).
      *
-     * @return list<array{id: int, language: string, format: string, downloads: int, filename: string}>
+     * @return list<array{
+     *     id: string,
+     *     language: string,
+     *     format: string,
+     *     downloads: int,
+     *     filename: string,
+     *     imdb_id: ?string,
+     *     file_id: int,
+     *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
+     * }> Each result's `file_id` (and `files[].file_id`) can be passed straight into
+     *    {@see download()}. See {@see filterSubtitles()} for the shape rationale.
      *
      * @throws OpenSubtitlesException When the search fails.
      *
@@ -342,7 +352,17 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * @param string $language       Language code (ISO 639-1).
      * @param string $subtitleFormat Preferred format (srt, sub, ass, etc.).
      *
-     * @return list<array{id: int, language: string, format: string, downloads: int, filename: string}>
+     * @return list<array{
+     *     id: string,
+     *     language: string,
+     *     format: string,
+     *     downloads: int,
+     *     filename: string,
+     *     imdb_id: ?string,
+     *     file_id: int,
+     *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
+     * }> Each result's `file_id` (and `files[].file_id`) can be passed straight into
+     *    {@see download()}. See {@see filterSubtitles()} for the shape rationale.
      *
      * @throws OpenSubtitlesException When the search fails.
      *
@@ -406,7 +426,17 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * @param string $language       Language code (ISO 639-1).
      * @param string $subtitleFormat Preferred format (srt, sub, ass, etc.).
      *
-     * @return list<array{id: int, language: string, format: string, downloads: int, filename: string}>
+     * @return list<array{
+     *     id: string,
+     *     language: string,
+     *     format: string,
+     *     downloads: int,
+     *     filename: string,
+     *     imdb_id: ?string,
+     *     file_id: int,
+     *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
+     * }> Each result's `file_id` (and `files[].file_id`) can be passed straight into
+     *    {@see download()}. See {@see filterSubtitles()} for the shape rationale.
      *
      * @throws OpenSubtitlesException When the search fails.
      *
@@ -573,10 +603,77 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     /**
      * Filter subtitles to prefer the requested format.
      *
-     * @param array<array<string, mixed>> $subtitles       Raw subtitles from API.
-     * @param string                      $preferredFormat Preferred format.
+     * The real OpenSubtitles v1 `/subtitles` search response is JSON:API shaped.
+     * Independently re-verified (not just trusting the prior investigation) against
+     * https://github.com/dusking/opensubtitles-com (`src/opensubtitlescom/responses.py`,
+     * the `Subtitle` class), https://apidog.com/blog/opensubtitles-api/, and the
+     * `odwrtw/opensubtitles` Go client's `File` struct — all three agree on the shape:
      *
-     * @return list<array{id: int, language: string, format: string, downloads: int, filename: string}>
+     * ```json
+     * {
+     *   "id": "3634077",
+     *   "type": "subtitle",
+     *   "attributes": {
+     *     "language": "en",
+     *     "download_count": 5000,
+     *     "feature_details": { "imdb_id": "tt1234567" },
+     *     "files": [
+     *       { "file_id": 998877, "cd_number": 1, "file_name": "Movie.Name.2019.srt" }
+     *     ]
+     *   }
+     * }
+     * ```
+     *
+     * This fixes three latent shape mismatches, all in this one method:
+     *
+     * 1. `attributes.file` (singular) does not exist — the real key is
+     *    `attributes.files` (plural), an ARRAY. A single subtitle listing can carry
+     *    multiple files (e.g. one file per CD for old multi-CD releases), each with
+     *    its own `file_id`. The old code always saw an empty `$fileInfo` and silently
+     *    fabricated a generic filename/format for every result.
+     * 2. `download()` requires a `file_id` (see its docblock), which was never
+     *    extracted at all — nothing wired a real file_id from search into download,
+     *    so the search→download pipeline was dead end-to-end for every caller.
+     * 3. `id` is a JSON:API resource id: always a STRING (confirmed via the Go
+     *    client's `ID string \`json:"id"\`` and the apidog example `"id": "1234567"`),
+     *    never an int — the old `is_int($subtitle['id'])` check was always false
+     *    against the real API, so every result's `id` silently collapsed to `0`.
+     *    `imdb_id` is nested under `attributes.feature_details.imdb_id`, not
+     *    `attributes.imdb_id` directly — the old flat read always saw `null`.
+     *
+     * There is no per-subtitle or per-file `format` attribute in the real API at
+     * all (verified absent from every reference client above); the only reliable
+     * signal is the file extension embedded in `file_name`, via
+     * {@see formatFromFilename()}.
+     *
+     * Multi-file (multi-CD) handling: rather than silently taking `files[0]` and
+     * discarding the rest (which would misrepresent a multi-part release as a
+     * single downloadable file) or exploding one API result into N synthetic
+     * search results (which would duplicate language/downloads/id across entries
+     * for what is really one release), each result keeps a `files` sub-array with
+     * every file's `file_id`/`file_name`/`cd_number`, plus a top-level `file_id`
+     * convenience alias for the first file — so a caller that only wants "the"
+     * file can use `file_id` directly, while a caller that needs to fetch every
+     * CD can iterate `files`.
+     *
+     * A subtitle entry with no usable file entries can never be downloaded (there
+     * is no `file_id` to pass to {@see download()}), so it is dropped rather than
+     * surfaced with a fake sentinel `file_id`.
+     *
+     * @param array<array<string, mixed>> $subtitles       Raw subtitles from API.
+     * @param string                      $preferredFormat Preferred format, used as a
+     *        fallback when the file name has no extension to derive one from.
+     *
+     * @return list<array{
+     *     id: string,
+     *     language: string,
+     *     format: string,
+     *     downloads: int,
+     *     filename: string,
+     *     imdb_id: ?string,
+     *     file_id: int,
+     *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
+     * }>
      *
      * @since 0.1.0
      */
@@ -588,15 +685,43 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             /** @var array<string, mixed> */
             $attributes = is_array($subtitle['attributes'] ?? null) ? $subtitle['attributes'] : [];
 
-            /** @var array<string, mixed> */
-            $fileInfo = is_array($attributes['file'] ?? null) ? $attributes['file'] : [];
+            /** @var list<mixed> */
+            $rawFiles = is_array($attributes['files'] ?? null) ? array_values($attributes['files']) : [];
 
-            $format = is_string($fileInfo['format'] ?? null) ? $fileInfo['format'] : 'srt';
+            $files = [];
+            foreach ($rawFiles as $rawFile) {
+                if (!is_array($rawFile) || !is_int($rawFile['file_id'] ?? null)) {
+                    continue;
+                }
+
+                $files[] = [
+                    'file_id' => $rawFile['file_id'],
+                    'file_name' => is_string($rawFile['file_name'] ?? null) ? $rawFile['file_name'] : null,
+                    'cd_number' => is_int($rawFile['cd_number'] ?? null) ? $rawFile['cd_number'] : 1,
+                ];
+            }
+
+            if ($files === []) {
+                // No file_id to download with — this result would be a dead end.
+                continue;
+            }
+
+            /** @var array<string, mixed> */
+            $featureDetails = is_array($attributes['feature_details'] ?? null) ? $attributes['feature_details'] : [];
+
+            $primaryFile = $files[0];
+            $filename = $primaryFile['file_name'] ?? "subtitle.{$preferredFormat}";
+            $format = self::formatFromFilename($primaryFile['file_name']) ?? $preferredFormat;
             $languageCode = is_string($attributes['language'] ?? null) ? $attributes['language'] : 'en';
             $downloadCount = is_int($attributes['download_count'] ?? null) ? $attributes['download_count'] : 0;
-            $filename = is_string($fileInfo['filename'] ?? null) ? $fileInfo['filename'] : "subtitle.{$format}";
-            $imdbId = is_string($attributes['imdb_id'] ?? null) ? $attributes['imdb_id'] : null;
-            $subtitleId = is_int($subtitle['id'] ?? null) ? $subtitle['id'] : 0;
+            $imdbId = is_string($featureDetails['imdb_id'] ?? null) ? $featureDetails['imdb_id'] : null;
+
+            $idRaw = $subtitle['id'] ?? null;
+            $subtitleId = match (true) {
+                is_string($idRaw) && $idRaw !== '' => $idRaw,
+                is_int($idRaw) => (string) $idRaw,
+                default => '',
+            };
 
             $results[] = [
                 'id' => $subtitleId,
@@ -605,6 +730,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
                 'downloads' => $downloadCount,
                 'filename' => $filename,
                 'imdb_id' => $imdbId,
+                'file_id' => $primaryFile['file_id'],
+                'files' => $files,
             ];
         }
 
@@ -612,6 +739,32 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         usort($results, static fn (array $a, array $b): int => $b['downloads'] <=> $a['downloads']);
 
         return $results;
+    }
+
+    /**
+     * Derive a lowercase subtitle format from a file's extension.
+     *
+     * The OpenSubtitles v1 search response has no per-subtitle or per-file
+     * `format` attribute (independently verified absent from the reference
+     * clients cited on {@see filterSubtitles()}) — the file extension embedded in
+     * `attributes.files[].file_name` is the only signal available.
+     *
+     * @param string|null $filename Subtitle file name (e.g. "Movie.srt"), or null.
+     *
+     * @return string|null Lowercase extension without the leading dot, or null if
+     *         the filename is null/empty or has no extension.
+     *
+     * @since 0.3.0
+     */
+    private static function formatFromFilename(?string $filename): ?string
+    {
+        if ($filename === null || $filename === '') {
+            return null;
+        }
+
+        $extension = pathinfo($filename, PATHINFO_EXTENSION);
+
+        return $extension !== '' ? strtolower($extension) : null;
     }
 
     /**
