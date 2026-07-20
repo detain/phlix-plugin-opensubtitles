@@ -4,20 +4,20 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "3c9e1a8a181bb5a900bb0bd652af1625",
+    "content-hash": "e27aa4762dbad2993d85e4147114f848",
     "packages": [
         {
             "name": "detain/phlix-shared",
-            "version": "v0.18.0",
+            "version": "0.21.0",
             "source": {
                 "type": "git",
                 "url": "https://github.com/detain/phlix-shared.git",
-                "reference": "9aea4cf9d9734f7146a43a7a08a4e02f27bc44f3"
+                "reference": "129946521f64182d5337f56f5617e05ba8d3bcde"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/detain/phlix-shared/zipball/9aea4cf9d9734f7146a43a7a08a4e02f27bc44f3",
-                "reference": "9aea4cf9d9734f7146a43a7a08a4e02f27bc44f3",
+                "url": "https://api.github.com/repos/detain/phlix-shared/zipball/129946521f64182d5337f56f5617e05ba8d3bcde",
+                "reference": "129946521f64182d5337f56f5617e05ba8d3bcde",
                 "shasum": ""
             },
             "require": {
@@ -68,10 +68,10 @@
             ],
             "description": "Shared interfaces, DTOs, event names, and protocol types used by both phlix-server and phlix-hub. Composer-installable, PHP 8.3+, zero I/O by charter — the only bundled network code is the blocking CurlArrTransport (CLI/test only); event-loop consumers MUST inject an async ArrTransportInterface.",
             "support": {
-                "source": "https://github.com/detain/phlix-shared/tree/v0.18.0",
+                "source": "https://github.com/detain/phlix-shared/tree/v0.21.0",
                 "issues": "https://github.com/detain/phlix-shared/issues"
             },
-            "time": "2026-07-11T00:05:49+00:00"
+            "time": "2026-07-20T16:32:01+00:00"
         },
         {
             "name": "guzzlehttp/guzzle",
