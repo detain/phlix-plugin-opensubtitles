@@ -1,6 +1,6 @@
 {
     "name": "phlix-plugin-opensubtitles",
-    "version": "0.5.0",
+    "version": "0.6.0",
     "phlix_min_server_version": "1.2.0",
     "type": "subtitle-provider",
     "entry": "Phlix\\PluginOpenSubtitles\\OpenSubtitlesProvider",
@@ -11,6 +11,7 @@
             "required": true,
             "secret": true,
             "default": null,
+            "tier": "standard",
             "label": "OpenSubtitles API Key",
             "description": "The API key for your OpenSubtitles.com consumer (API application). Required.",
             "link": "https://www.opensubtitles.com/en/consumers",
@@ -20,6 +21,7 @@
             "type": "string",
             "required": false,
             "default": null,
+            "tier": "advanced",
             "label": "Username",
             "description": "Your OpenSubtitles.com username. Optional — providing login credentials raises download limits (and unlocks VIP limits for VIP accounts)."
         },
@@ -28,6 +30,7 @@
             "required": false,
             "secret": true,
             "default": null,
+            "tier": "advanced",
             "label": "Password",
             "description": "Your OpenSubtitles.com password. Optional; only used together with the username above."
         },
@@ -35,6 +38,7 @@
             "type": "string",
             "required": false,
             "default": "en",
+            "tier": "advanced",
             "label": "Subtitle language",
             "description": "Preferred subtitle language as an ISO 639-1 code (e.g. en, es, fr). Optional; default en."
         },
@@ -42,6 +46,7 @@
             "type": "string",
             "required": false,
             "default": "srt",
+            "tier": "advanced",
             "label": "Subtitle format",
             "description": "Preferred subtitle format (srt, sub, ass, etc.). Optional; default srt."
         },
@@ -49,6 +54,7 @@
             "type": "integer",
             "required": false,
             "default": 10,
+            "tier": "advanced",
             "label": "Source priority",
             "description": "Ranking weight for this subtitle source relative to others. Lower runs first (0 = highest priority). Admins can still override the effective order via the server subtitle-provider priority list."
         }
