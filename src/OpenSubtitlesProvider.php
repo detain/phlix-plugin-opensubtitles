@@ -11,9 +11,6 @@ declare(strict_types=1);
 
 namespace Phlix\PluginOpenSubtitles;
 
-use GuzzleHttp\Client;
-use GuzzleHttp\Exception\GuzzleException;
-use GuzzleHttp\Exception\RequestException;
 use Phlix\Shared\Plugin\ConfigurableInterface;
 use Phlix\Shared\Plugin\LifecycleInterface;
 use Phlix\Shared\Plugin\Manifest;
@@ -21,25 +18,47 @@ use Psr\Container\ContainerInterface;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 use RuntimeException;
+use Throwable;
+use Workerman\Http\Client;
+use Workerman\Http\Response;
 
 /**
  * OpenSubtitles subtitle provider for Phlix.
  *
  * This plugin integrates with the OpenSubtitles REST API v1 to search
  * and download subtitles for movies and TV shows. It supports search
- * by IMDB ID, filename, and file hash.
+ * by IMDB ID, filename, and file hash (`moviehash`).
  *
- * ## Lifecycle notes
+ * ## Boot safety (Workerman/Webman resident memory)
  *
- * - {@see onEnable()} initialises the HTTP client and optionally logs
- *   in to OpenSubtitles to obtain a session token.
- * - {@see subscribedEvents()} returns an empty array; subtitle lookups
- *   are triggered by the host's subtitle pipeline directly rather than
- *   via PSR-14 events.
+ * The host loads plugins into ~14 long-lived Workerman workers. Blocking I/O
+ * in {@see onEnable()} at boot is the exact defect that caused the 2026-07-18
+ * production revert, so this plugin is split into:
  *
- * ## Provenance
+ * - {@see onEnable()} — the cheap "wire" step. Adopts the host logger and marks
+ *   the provider enabled. It performs **NO network I/O and never logs in.**
+ * - {@see ensureConnected()} — the lazy "connect" step. The first authenticated
+ *   API call (search/download) logs in to obtain a session token, once per
+ *   enable cycle. Never at boot.
  *
- * The OpenSubtitles API is documented at https://www.opensubtitles.com/.
+ * ## Non-blocking HTTP
+ *
+ * All HTTP goes through {@see httpRequest()}, which uses the non-blocking
+ * `workerman/http-client` with the canonical cooperative-wait pattern (see
+ * phlix-server `CLAUDE.md`). A closure `$transport` seam lets tests exercise
+ * the request/response shaping without an event loop or the network.
+ *
+ * ## Download quota
+ *
+ * OpenSubtitles enforces a per-account daily download quota, so fetches are
+ * strictly on-demand — this plugin never bulk-downloads or loops over results.
+ * Quota exhaustion is surfaced as {@see OpenSubtitlesQuotaExceededException}.
+ *
+ * ## Dispatch
+ *
+ * {@see subscribedEvents()} returns an empty array; subtitle lookups are driven
+ * by the host's subtitle pipeline (Wave 3 `SubtitleSourceInterface`) rather
+ * than via PSR-14 events.
  *
  * @package Phlix\PluginOpenSubtitles
  * @since 0.1.0
@@ -47,19 +66,8 @@ use RuntimeException;
 final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInterface
 {
     /**
-     * OpenSubtitles API base URL.
-     *
-     * MUST keep the trailing slash: Guzzle resolves relative request paths
-     * against `base_uri` using RFC 3986 §5.3 reference resolution. A
-     * leading-slash request path (e.g. `/login`) is treated as an
-     * absolute-path reference and REPLACES the entire path component of
-     * `base_uri` (dropping `/api/v1` and leaving only the scheme+host) —
-     * that mismatch previously produced 404s such as
-     * `https://api.opensubtitles.com/v2/uselogin`. With a trailing slash on
-     * the base and no leading slash on request paths, RFC 3986 merge
-     * resolution correctly appends the path (e.g. `/api/v1/login`).
-     *
-     * @see https://opensubtitles.stoplight.io/docs/opensubtitles-api/73acf79accc0a-login
+     * OpenSubtitles API base URL. Keeps a trailing slash; request paths are
+     * appended without a leading slash so the `/api/v1` prefix is preserved.
      */
     private const API_BASE = 'https://api.opensubtitles.com/api/v1/';
 
@@ -74,7 +82,18 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     private const DEFAULT_FORMAT = 'srt';
 
     /**
-     * OpenSubtitles API key (user agent token).
+     * HTTP request timeout in seconds.
+     */
+    private const HTTP_TIMEOUT_SEC = 30;
+
+    /**
+     * Chunk size (bytes) read from the head and tail of a media file for the
+     * OpenSubtitles `moviehash` — 64 KiB, per the algorithm specification.
+     */
+    private const HASH_CHUNK_SIZE = 65536;
+
+    /**
+     * OpenSubtitles API key (consumer token).
      */
     private string $apiKey;
 
@@ -99,9 +118,19 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     private string $format;
 
     /**
-     * HTTP client for API requests.
+     * Shared non-blocking HTTP client, created lazily on first real request.
      */
-    private Client $httpClient;
+    private ?Client $httpClient = null;
+
+    /**
+     * Test seam replacing the network call. Signature:
+     * `fn(string $method, string $url, array<string,string> $headers, ?string $body): array{status:int, body:string}`.
+     * Left null in production so the real non-blocking Workerman client is used.
+     *
+     * @var (\Closure(string, string, array<string,string>, ?string): array{status:int, body:string})|null
+     * @internal Tests only.
+     */
+    private ?\Closure $transport;
 
     /**
      * Session token obtained via login.
@@ -109,30 +138,34 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     private ?string $sessionToken = null;
 
     /**
+     * Whether the deferred login has already been attempted this enable cycle.
+     * Prevents a failed/absent login from re-hitting the network on every call.
+     */
+    private bool $loginAttempted = false;
+
+    /**
      * Logger instance.
-     *
-     * @var LoggerInterface
      */
     private LoggerInterface $logger;
 
     /**
-     * Whether the provider has been enabled.
+     * Whether the provider has been enabled (wired).
      */
     private bool $enabled = false;
 
     /**
-     * Cached result of {@see self::pluginVersion()}, populated lazily on first
-     * use (shared across every instance in the process — `plugin.json` cannot
-     * change without a redeploy, so re-reading it per-instance is pointless).
+     * Cached result of {@see self::pluginVersion()} for the process lifetime.
      */
     private static ?string $cachedPluginVersion = null;
 
     /**
-     * @param string      $apiKey   OpenSubtitles API key.
-     * @param string|null $username OpenSubtitles username (optional).
-     * @param string|null $password OpenSubtitles password (optional).
-     * @param string      $language Default language code (ISO 639-1).
-     * @param string      $format   Preferred subtitle format.
+     * @param string      $apiKey    OpenSubtitles API key.
+     * @param string|null $username  OpenSubtitles username (optional).
+     * @param string|null $password  OpenSubtitles password (optional).
+     * @param string      $language  Default language code (ISO 639-1).
+     * @param string      $format    Preferred subtitle format.
+     * @param (\Closure(string, string, array<string,string>, ?string): array{status:int, body:string})|null $transport
+     *        Test seam replacing the network call; null in production.
      */
     public function __construct(
         string $apiKey = '',
@@ -140,25 +173,26 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         ?string $password = null,
         string $language = self::DEFAULT_LANGUAGE,
         string $format = self::DEFAULT_FORMAT,
+        ?\Closure $transport = null,
     ) {
         // The constructor MUST stay autowirable — the host loader builds the
-        // entry class through its PSR-11 container, which cannot guess a
-        // required `string $apiKey`. So the key defaults to '' here and the real
-        // settings arrive via configure() before onEnable().
+        // entry class through its PSR-11 container with no arguments. Real
+        // settings arrive via configure() before onEnable(). Nothing here does
+        // I/O, so construction at boot is cheap and safe.
         $this->apiKey = $apiKey;
         $this->username = $username;
         $this->password = $password;
         $this->language = $language;
         $this->format = $format;
-        $this->rebuildHttpClient();
+        $this->transport = $transport;
         $this->logger = new NullLogger();
     }
 
     /**
      * Receive the plugin's persisted settings from the host.
      *
-     * Called once by the loader between construction and {@see onEnable()}, so
-     * onEnable() authenticates with the configured API key/credentials.
+     * Called once by the loader between construction and {@see onEnable()}.
+     * Does NOT perform any network I/O (no login) — configuration only.
      *
      * @param array<string, mixed> $settings Persisted settings (manifest keys:
      *        `api_key`, `username`, `password`, `language`, `format`).
@@ -178,55 +212,20 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $this->format = is_string($settings['format'] ?? null) && $settings['format'] !== ''
             ? $settings['format']
             : self::DEFAULT_FORMAT;
-        $this->rebuildHttpClient();
-    }
 
-    /**
-     * (Re)build the API HTTP client so it carries the current `Api-Key` header.
-     * Called from the constructor and whenever settings change via
-     * {@see configure()}.
-     */
-    private function rebuildHttpClient(): void
-    {
-        $this->httpClient = new Client([
-            'base_uri' => self::API_BASE,
-            'timeout' => 30,
-            'headers' => [
-                'Api-Key' => $this->apiKey,
-                'User-Agent' => 'Phlix-Plugin-OpenSubtitles/' . self::pluginVersion(),
-                'Accept' => 'application/json',
-            ],
-        ]);
+        // Credentials may have changed — allow a fresh deferred login on next use.
+        $this->sessionToken = null;
+        $this->loginAttempted = false;
     }
 
     /**
      * This plugin's own version, read from its `plugin.json` manifest.
      *
-     * The `User-Agent` header used to carry a hardcoded literal
-     * (`Phlix-Plugin-OpenSubtitles/0.1.0`) that was never updated across
-     * several real version bumps (it still said `0.1.0` once the manifest
-     * had moved on to `0.2.0`, then `0.3.x`) — deriving it from the manifest
-     * here means it can never go stale like that again.
+     * The result is cached for the process lifetime. Never throws — it runs from
+     * inside header construction on every request.
      *
-     * `plugin.json` lives at this package's root, one directory above `src/`
-     * — true both for a git checkout of this repo and for a Composer install
-     * under `vendor/detain/phlix-plugin-opensubtitles/` (see phlix-server's
-     * `PluginLoader`, which expects the manifest there) — so the path is
-     * resolved relative to this class's own file rather than any host
-     * working directory. Parsing itself is delegated to
-     * {@see Manifest::fromJson()} (from `detain/phlix-shared`, already a
-     * dependency of this plugin) rather than hand-rolling `json_decode()`
-     * here.
-     *
-     * The result is cached for the lifetime of the process: {@see
-     * self::rebuildHttpClient()} is called from both the constructor and
-     * {@see self::configure()}, so without caching every settings change
-     * would re-read and re-parse the manifest file for no benefit (the
-     * version cannot change without a redeploy).
-     *
-     * @return string The manifest's `version` field, or `'unknown'` if the
-     *         file is missing, unreadable, or malformed — this must never
-     *         throw, since it runs from inside the `Client` constructor.
+     * @return string The manifest's `version` field, or `'unknown'` if the file
+     *         is missing, unreadable, or malformed.
      *
      * @since 0.3.2
      */
@@ -267,9 +266,12 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     }
 
     /**
-     * Loader hook called once when the plugin is enabled.
+     * Loader hook called once when the plugin is enabled — the cheap "wire" step.
      *
-     * Authenticates with OpenSubtitles if credentials are configured.
+     * Adopts the host logger and marks the provider enabled. It performs NO
+     * network I/O and does NOT log in: at boot this runs across every worker,
+     * and blocking here is the item-5c3 landmine. Authentication is deferred to
+     * the first actual use via {@see ensureConnected()}.
      *
      * @param ContainerInterface $container Host PSR-11 container.
      *
@@ -285,11 +287,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             $this->logger = $logger;
         }
 
-        if ($this->username !== null && $this->password !== null) {
-            $this->login();
-        }
-
         $this->enabled = true;
+        $this->loginAttempted = false;
     }
 
     /**
@@ -304,15 +303,15 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     public function onDisable(): void
     {
         $this->sessionToken = null;
+        $this->loginAttempted = false;
         $this->enabled = false;
     }
 
     /**
      * Returns the PSR-14 listener subscriptions this plugin wants.
      *
-     * This plugin is invoked directly by the host's subtitle pipeline
-     * rather than via the event dispatcher, so it returns an empty
-     * array.
+     * This plugin is invoked directly by the host's subtitle pipeline rather
+     * than via the event dispatcher, so it returns an empty array.
      *
      * @return array<class-string, string|callable> Always empty.
      *
@@ -324,34 +323,68 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     }
 
     /**
-     * Authenticate with OpenSubtitles and obtain a session token.
+     * Lazily authenticate with OpenSubtitles on first authenticated use.
+     *
+     * Runs at most once per enable cycle (guarded by {@see $loginAttempted}).
+     * Login is OPTIONAL — it merely raises download limits — so a failure is
+     * logged and the provider continues anonymously rather than throwing and
+     * breaking search/download. This is the deferred "connect" half of the
+     * boot-safety split; it is never invoked from {@see onEnable()}.
      *
      * @return void
      *
-     * @throws OpenSubtitlesException When login fails.
+     * @since 0.4.0
+     */
+    private function ensureConnected(): void
+    {
+        if ($this->loginAttempted) {
+            return;
+        }
+
+        $this->loginAttempted = true;
+
+        if ($this->username === null || $this->password === null) {
+            return;
+        }
+
+        $this->login();
+    }
+
+    /**
+     * Authenticate with OpenSubtitles and obtain a session token.
+     *
+     * Non-throwing: login is optional, so a transport or credential failure is
+     * logged and the provider stays anonymous.
+     *
+     * @return void
      *
      * @since 0.1.0
      */
     private function login(): void
     {
+        $body = (string) json_encode([
+            'username' => $this->username,
+            'password' => $this->password,
+        ]);
+
         try {
-            $response = $this->httpClient->post('login', [
-                'json' => [
-                    'username' => $this->username,
-                    'password' => $this->password,
-                ],
-            ]);
+            $response = $this->httpRequest('POST', 'login', ['Content-Type' => 'application/json'], $body);
+        } catch (OpenSubtitlesException $e) {
+            $this->logger->warning('OpenSubtitles login transport failed: ' . $e->getMessage());
 
-            /** @var array<string, mixed> */
-            $data = json_decode((string) $response->getBody(), true);
+            return;
+        }
 
-            if (isset($data['token']) && is_string($data['token'])) {
-                $this->sessionToken = $data['token'];
-                $this->logger->info('OpenSubtitles login successful');
-            }
-        } catch (GuzzleException $e) {
-            $this->logger->warning('OpenSubtitles login failed: ' . $e->getMessage());
-            throw new OpenSubtitlesException('Login failed: ' . $e->getMessage(), 0, $e);
+        if ($response['status'] < 200 || $response['status'] >= 300) {
+            $this->logger->warning('OpenSubtitles login failed with HTTP ' . $response['status']);
+
+            return;
+        }
+
+        $data = json_decode($response['body'], true);
+        if (is_array($data) && isset($data['token']) && is_string($data['token'])) {
+            $this->sessionToken = $data['token'];
+            $this->logger->info('OpenSubtitles login successful');
         }
     }
 
@@ -371,8 +404,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *     imdb_id: ?string,
      *     file_id: int,
      *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
-     * }> Each result's `file_id` (and `files[].file_id`) can be passed straight into
-     *    {@see download()}. See {@see filterSubtitles()} for the shape rationale.
+     * }>
      *
      * @throws OpenSubtitlesException When the search fails.
      *
@@ -384,38 +416,64 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $subtitleFormat = $subtitleFormat ?: $this->format;
 
         $this->ensureEnabled();
+        $this->ensureConnected();
 
-        try {
-            $queryParams = [
-                'imdb_id' => $imdbId,
-                'languages' => $language,
-            ];
-
-            $headers = [];
-            if ($this->sessionToken !== null) {
-                $headers['Authorization'] = 'Bearer ' . $this->sessionToken;
-            }
-
-            $response = $this->httpClient->get('subtitles', [
-                'query' => $queryParams,
-                'headers' => $headers,
-            ]);
-
-            /** @var array<string, mixed> */
-            $data = json_decode((string) $response->getBody(), true);
-
-            /** @var list<array<string, mixed>> */
-            $subtitles = is_array($data['data'] ?? null) ? $data['data'] : [];
-
-            return $this->filterSubtitles($subtitles, $subtitleFormat);
-        } catch (GuzzleException $e) {
-            $this->logger->error('OpenSubtitles search by IMDB ID failed: ' . $e->getMessage());
-            throw new OpenSubtitlesException('Search by IMDB ID failed: ' . $e->getMessage(), 0, $e);
-        }
+        return $this->searchSubtitles([
+            'imdb_id' => $imdbId,
+            'languages' => $language,
+        ], $subtitleFormat, 'IMDB ID');
     }
 
     /**
-     * Search for subtitles matching the given filename.
+     * Search for subtitles for a media file on disk — the preferred entry point.
+     *
+     * Computes the OpenSubtitles `moviehash` from the file (see
+     * {@see computeMovieHash()}) and searches by hash + filesize, which yields
+     * the most accurate matches. If the hash cannot be computed or the hash
+     * search returns nothing, it falls back to a filename-based search.
+     *
+     * This is a single on-demand call chain — it never loops or bulk-fetches,
+     * respecting the OpenSubtitles download quota.
+     *
+     * @param string $filePath       Absolute path to the media file.
+     * @param string $language       Language code (ISO 639-1).
+     * @param string $subtitleFormat Preferred format (srt, sub, ass, etc.).
+     *
+     * @return list<array{
+     *     id: string,
+     *     language: string,
+     *     format: string,
+     *     downloads: int,
+     *     filename: string,
+     *     imdb_id: ?string,
+     *     file_id: int,
+     *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
+     * }>
+     *
+     * @throws OpenSubtitlesException When the search fails.
+     *
+     * @since 0.4.0
+     */
+    public function searchByPath(string $filePath, string $language = '', string $subtitleFormat = ''): array
+    {
+        $this->ensureEnabled();
+
+        $hash = self::computeMovieHash($filePath);
+        $size = is_file($filePath) ? filesize($filePath) : false;
+
+        if ($hash !== '' && $size !== false && $size > 0) {
+            $results = $this->searchByHash($hash, $size, $language, $subtitleFormat);
+            if ($results !== []) {
+                return $results;
+            }
+        }
+
+        // Fallback: no usable hash, or the hash matched nothing.
+        return $this->searchByFilename(basename($filePath), $language, $subtitleFormat);
+    }
+
+    /**
+     * Search for subtitles matching the given filename (fallback path).
      *
      * @param string $filename       Media filename.
      * @param string $language       Language code (ISO 639-1).
@@ -430,8 +488,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *     imdb_id: ?string,
      *     file_id: int,
      *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
-     * }> Each result's `file_id` (and `files[].file_id`) can be passed straight into
-     *    {@see download()}. See {@see filterSubtitles()} for the shape rationale.
+     * }>
      *
      * @throws OpenSubtitlesException When the search fails.
      *
@@ -443,54 +500,31 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $subtitleFormat = $subtitleFormat ?: $this->format;
 
         $this->ensureEnabled();
+        $this->ensureConnected();
 
-        // Extract media info from filename and compute hash if possible
         $mediaInfo = $this->parseFilename($filename);
 
-        try {
-            $queryParams = [
-                'languages' => $language,
-            ];
+        $queryParams = ['languages' => $language];
 
-            if ($mediaInfo['imdb_id'] !== null) {
-                $queryParams['imdb_id'] = $mediaInfo['imdb_id'];
-            }
-
-            if ($mediaInfo['hash'] !== null) {
-                $queryParams['hash'] = $mediaInfo['hash'];
-            }
-
-            if (isset($queryParams['imdb_id']) || isset($queryParams['hash'])) {
-                $headers = [];
-                if ($this->sessionToken !== null) {
-                    $headers['Authorization'] = 'Bearer ' . $this->sessionToken;
-                }
-
-                $response = $this->httpClient->get('subtitles', [
-                    'query' => $queryParams,
-                    'headers' => $headers,
-                ]);
-
-                /** @var array<string, mixed> */
-                $data = json_decode((string) $response->getBody(), true);
-
-                /** @var list<array<string, mixed>> */
-                $subtitles = is_array($data['data'] ?? null) ? $data['data'] : [];
-
-                return $this->filterSubtitles($subtitles, $subtitleFormat);
-            }
-
-            return [];
-        } catch (GuzzleException $e) {
-            $this->logger->error('OpenSubtitles search by filename failed: ' . $e->getMessage());
-            throw new OpenSubtitlesException('Search by filename failed: ' . $e->getMessage(), 0, $e);
+        if ($mediaInfo['imdb_id'] !== null) {
+            $queryParams['imdb_id'] = $mediaInfo['imdb_id'];
         }
+
+        // A bare filename query is the weakest signal, but useful when we have
+        // neither an IMDB id nor an on-disk file to hash.
+        $queryParams['query'] = pathinfo($filename, PATHINFO_FILENAME);
+
+        return $this->searchSubtitles($queryParams, $subtitleFormat, 'filename');
     }
 
     /**
-     * Search for subtitles matching the given file hash.
+     * Search for subtitles matching the given `moviehash`.
      *
-     * @param string $hash           OpenSubtitles hash (first 64KB + last 64KB of file).
+     * Sends both the hash (`moviehash`) and the file size (`moviebytesize`).
+     * The v1 REST API primarily keys on `moviehash`; the byte size is included
+     * for disambiguation and legacy-parameter compatibility.
+     *
+     * @param string $hash           OpenSubtitles `moviehash` (see {@see computeMovieHash()}).
      * @param int    $size           File size in bytes.
      * @param string $language       Language code (ISO 639-1).
      * @param string $subtitleFormat Preferred format (srt, sub, ass, etc.).
@@ -504,8 +538,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *     imdb_id: ?string,
      *     file_id: int,
      *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
-     * }> Each result's `file_id` (and `files[].file_id`) can be passed straight into
-     *    {@see download()}. See {@see filterSubtitles()} for the shape rationale.
+     * }>
      *
      * @throws OpenSubtitlesException When the search fails.
      *
@@ -517,94 +550,95 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $subtitleFormat = $subtitleFormat ?: $this->format;
 
         $this->ensureEnabled();
+        $this->ensureConnected();
 
-        try {
-            $queryParams = [
-                'hash' => $hash,
-                'languages' => $language,
-            ];
-
-            $headers = [];
-            if ($this->sessionToken !== null) {
-                $headers['Authorization'] = 'Bearer ' . $this->sessionToken;
-            }
-
-            $response = $this->httpClient->get('subtitles', [
-                'query' => $queryParams,
-                'headers' => $headers,
-            ]);
-
-            /** @var array<string, mixed> */
-            $data = json_decode((string) $response->getBody(), true);
-
-            /** @var list<array<string, mixed>> */
-            $subtitles = is_array($data['data'] ?? null) ? $data['data'] : [];
-
-            return $this->filterSubtitles($subtitles, $subtitleFormat);
-        } catch (GuzzleException $e) {
-            $this->logger->error('OpenSubtitles search by hash failed: ' . $e->getMessage());
-            throw new OpenSubtitlesException('Search by hash failed: ' . $e->getMessage(), 0, $e);
-        }
+        return $this->searchSubtitles([
+            'moviehash' => $hash,
+            'moviebytesize' => (string) $size,
+            'languages' => $language,
+        ], $subtitleFormat, 'hash');
     }
 
     /**
-     * Download a subtitle file.
+     * Execute a `/subtitles` GET search with the given query parameters and
+     * filter the JSON:API results.
      *
-     * The real OpenSubtitles v1 REST API is a two-step flow — it does NOT return
-     * subtitle content directly:
+     * @param array<string, string> $queryParams     Query parameters.
+     * @param string                $subtitleFormat  Preferred format.
+     * @param string                $context         Human label for error logs.
+     *
+     * @return list<array{
+     *     id: string,
+     *     language: string,
+     *     format: string,
+     *     downloads: int,
+     *     filename: string,
+     *     imdb_id: ?string,
+     *     file_id: int,
+     *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
+     * }>
+     *
+     * @throws OpenSubtitlesException When the search fails.
+     */
+    private function searchSubtitles(array $queryParams, string $subtitleFormat, string $context): array
+    {
+        $url = self::API_BASE . 'subtitles?' . http_build_query($queryParams);
+
+        try {
+            $response = $this->httpRequest('GET', $url, $this->authHeaders());
+        } catch (OpenSubtitlesException $e) {
+            $this->logger->error("OpenSubtitles search by {$context} failed: " . $e->getMessage());
+
+            throw new OpenSubtitlesException("Search by {$context} failed: " . $e->getMessage(), 0, $e);
+        }
+
+        if ($response['status'] < 200 || $response['status'] >= 300) {
+            $this->logger->error("OpenSubtitles search by {$context} failed: HTTP " . $response['status']);
+
+            throw new OpenSubtitlesException("Search by {$context} failed: HTTP " . $response['status']);
+        }
+
+        $data = json_decode($response['body'], true);
+
+        /** @var list<array<string, mixed>> $subtitles */
+        $subtitles = is_array($data) && is_array($data['data'] ?? null) ? array_values($data['data']) : [];
+
+        return $this->filterSubtitles($subtitles, $subtitleFormat);
+    }
+
+    /**
+     * Download a single subtitle file — strictly on demand (quota-metered).
+     *
+     * The real OpenSubtitles v1 REST API is a two-step flow:
      *
      * 1. `POST download` with a `file_id` JSON body returns a JSON envelope
-     *    containing a temporary `link` URL plus download-quota accounting
-     *    (`requests`, `remaining`, `message`, `reset_time`, `reset_time_utc`).
-     *    This call itself counts against the account's download quota, so it
-     *    must not be retried speculatively.
-     * 2. The actual subtitle file bytes are then fetched with a plain `GET`
-     *    against that `link` URL (a different host, not `API_BASE`).
+     *    containing a temporary `link` URL plus download-quota accounting. This
+     *    call itself counts against the account's download quota, so it must
+     *    never be retried speculatively or looped.
+     * 2. The actual subtitle bytes are fetched with a plain `GET` against that
+     *    `link` (a different host, not `API_BASE`).
      *
-     * Quota exhaustion is surfaced distinctly (as a
-     * {@see OpenSubtitlesQuotaExceededException}, a subtype of
-     * {@see OpenSubtitlesException} so existing catch sites keep working)
-     * rather than as a generic failure, in two ways — confirmed against real
-     * reports (e.g. https://github.com/morpheus65535/bazarr/issues/2153) since
-     * the OpenAPI spec itself does not document an explicit quota-exceeded
-     * error shape:
+     * Quota exhaustion is surfaced distinctly as
+     * {@see OpenSubtitlesQuotaExceededException} — either from a 4xx `message`
+     * body ({@see mapDownloadLinkFailure()}) or from a 200 response reporting
+     * `remaining: 0` with no `link`.
      *
-     * - The step-1 `POST` can itself fail with a 4xx status whose JSON body is
-     *   just `{"message": "You have downloaded your allowed N subtitles for
-     *   24h. Your quota will be renewed in ..."}` — this is the shape actually
-     *   observed in production. {@see mapDownloadLinkFailure()} inspects that
-     *   body and re-throws a quota-specific exception when the message text
-     *   looks like a quota notice, rather than the generic
-     *   `'Download failed: ' . $e->getMessage()` every other failure gets.
-     * - Defensively, if the step-1 call instead returns HTTP 200 with
-     *   `remaining: 0` and no `link` at all, that is also treated as quota
-     *   exhaustion rather than the generic "missing download link" error.
-     *
-     * @see https://opensubtitles.stoplight.io/docs/opensubtitles-api/6be7f6ae2d918-download
-     *
-     * @param int $fileId OpenSubtitles file ID (`attributes.files[].file_id` from a
-     *        `/subtitles` search result — NOT the top-level subtitle `id`).
+     * @param int $fileId OpenSubtitles file ID (`attributes.files[].file_id`).
      *
      * @return SubtitleDownload
      *
-     * @throws OpenSubtitlesQuotaExceededException When the account's download quota
-     *         is exhausted.
-     * @throws OpenSubtitlesException When the download otherwise fails, or the API
-     *         response is missing the `link` needed to fetch the file content.
+     * @throws OpenSubtitlesQuotaExceededException When the download quota is exhausted.
+     * @throws OpenSubtitlesException When the download otherwise fails.
      *
      * @since 0.1.0
      */
     public function download(int $fileId): SubtitleDownload
     {
         $this->ensureEnabled();
+        $this->ensureConnected();
 
-        $headers = [
-            'Accept' => 'application/json',
-        ];
-
-        if ($this->sessionToken !== null) {
-            $headers['Authorization'] = 'Bearer ' . $this->sessionToken;
-        }
+        $headers = $this->authHeaders();
+        $headers['Content-Type'] = 'application/json';
 
         $body = ['file_id' => $fileId];
         if ($this->format !== '') {
@@ -612,16 +646,25 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         }
 
         try {
-            $linkResponse = $this->httpClient->post('download', [
-                'headers' => $headers,
-                'json' => $body,
-            ]);
-        } catch (GuzzleException $e) {
-            throw $this->mapDownloadLinkFailure($e);
+            $linkResponse = $this->httpRequest(
+                'POST',
+                self::API_BASE . 'download',
+                $headers,
+                (string) json_encode($body),
+            );
+        } catch (OpenSubtitlesException $e) {
+            $this->logger->error('OpenSubtitles download failed: ' . $e->getMessage());
+
+            throw new OpenSubtitlesException('Download failed: ' . $e->getMessage(), 0, $e);
         }
 
-        /** @var array<string, mixed> */
-        $data = json_decode((string) $linkResponse->getBody(), true);
+        $decoded = json_decode($linkResponse['body'], true);
+        /** @var array<string, mixed> $data */
+        $data = is_array($decoded) ? $decoded : [];
+
+        if ($linkResponse['status'] >= 400) {
+            throw $this->mapDownloadLinkFailure($linkResponse['status'], $data);
+        }
 
         $remaining = is_int($data['remaining'] ?? null) ? $data['remaining'] : null;
         $link = is_string($data['link'] ?? null) && $data['link'] !== '' ? $data['link'] : null;
@@ -641,16 +684,21 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             : "subtitle.{$this->format}";
 
         try {
-            $contentResponse = $this->httpClient->get($link);
-        } catch (GuzzleException $e) {
+            $contentResponse = $this->httpRequest('GET', $link);
+        } catch (OpenSubtitlesException $e) {
             $this->logger->error('OpenSubtitles download failed: ' . $e->getMessage());
+
             throw new OpenSubtitlesException('Download failed: ' . $e->getMessage(), 0, $e);
         }
 
-        $content = (string) $contentResponse->getBody();
+        if ($contentResponse['status'] < 200 || $contentResponse['status'] >= 300) {
+            $this->logger->error('OpenSubtitles download failed: HTTP ' . $contentResponse['status']);
+
+            throw new OpenSubtitlesException('Download failed: HTTP ' . $contentResponse['status']);
+        }
 
         return new SubtitleDownload(
-            content: $content,
+            content: $contentResponse['body'],
             format: $this->format,
             fileName: $fileName,
             requestsUsed: is_int($data['requests'] ?? null) ? $data['requests'] : null,
@@ -662,51 +710,34 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     }
 
     /**
-     * Translate a failure from the step-1 `POST download` call into either a
+     * Translate a 4xx failure from the step-1 `POST download` call into either a
      * quota-specific exception or the generic download-failure exception.
      *
-     * The real API's documented quota-exceeded shape (see {@see download()}'s
-     * docblock) is an HTTP 4xx response whose JSON body is just a `message`
-     * string — there is no dedicated error code to switch on, so the message
-     * text itself is inspected via {@see looksLikeQuotaMessage()}.
-     *
-     * @param GuzzleException $e The exception thrown by the step-1 POST call.
+     * @param int                  $statusCode The HTTP status of the step-1 response.
+     * @param array<string, mixed> $data       Decoded step-1 response body.
      *
      * @return OpenSubtitlesException Ready to be thrown by the caller.
      *
      * @since 0.3.2
      */
-    private function mapDownloadLinkFailure(GuzzleException $e): OpenSubtitlesException
+    private function mapDownloadLinkFailure(int $statusCode, array $data): OpenSubtitlesException
     {
-        $response = $e instanceof RequestException ? $e->getResponse() : null;
+        $message = is_string($data['message'] ?? null) ? $data['message'] : null;
 
-        if ($response !== null) {
-            $statusCode = $response->getStatusCode();
+        if ($statusCode < 500 && $message !== null && self::looksLikeQuotaMessage($message)) {
+            $this->logger->warning('OpenSubtitles download quota exceeded: ' . $message);
 
-            if ($statusCode >= 400 && $statusCode < 500) {
-                $decoded = json_decode((string) $response->getBody(), true);
-                $responseData = is_array($decoded) ? $decoded : [];
-                $message = is_string($responseData['message'] ?? null) ? $responseData['message'] : null;
-
-                if ($message !== null && self::looksLikeQuotaMessage($message)) {
-                    $this->logger->warning('OpenSubtitles download quota exceeded: ' . $message);
-
-                    return new OpenSubtitlesQuotaExceededException(
-                        $message,
-                        resetTime: is_string($responseData['reset_time'] ?? null)
-                            ? $responseData['reset_time']
-                            : null,
-                        resetTimeUtc: is_string($responseData['reset_time_utc'] ?? null)
-                            ? $responseData['reset_time_utc']
-                            : null,
-                    );
-                }
-            }
+            return new OpenSubtitlesQuotaExceededException(
+                $message,
+                resetTime: is_string($data['reset_time'] ?? null) ? $data['reset_time'] : null,
+                resetTimeUtc: is_string($data['reset_time_utc'] ?? null) ? $data['reset_time_utc'] : null,
+            );
         }
 
-        $this->logger->error('OpenSubtitles download failed: ' . $e->getMessage());
+        $detail = $message ?? ('HTTP ' . $statusCode);
+        $this->logger->error('OpenSubtitles download failed: ' . $detail);
 
-        return new OpenSubtitlesException('Download failed: ' . $e->getMessage(), 0, $e);
+        return new OpenSubtitlesException('Download failed: ' . $detail);
     }
 
     /**
@@ -736,15 +767,6 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * Heuristically decide whether an API error message describes download
      * quota exhaustion.
      *
-     * The OpenSubtitles v1 API has no dedicated error code for this (see
-     * {@see download()}'s docblock), only a free-text `message` — observed in
-     * production as e.g. "You have downloaded your allowed 20 subtitles for
-     * 24h.Your quota will be renewed in ...". Matching loosely on
-     * "quota"/"download limit" (mirroring the wording the
-     * `dusking/opensubtitles-com` reference client itself uses: "Download
-     * limit reached") avoids mis-detecting an unrelated 4xx (e.g. a stale
-     * token) as quota exhaustion while still catching the real message.
-     *
      * @param string $message API-provided error message text.
      *
      * @return bool True if the message looks like a quota-exceeded notice.
@@ -759,9 +781,124 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     }
 
     /**
-     * Parse a filename to extract media information.
+     * Perform a non-blocking HTTP request via `workerman/http-client`.
      *
-     * Attempts to extract IMDB ID from common naming patterns.
+     * Uses the canonical cooperative-wait pattern documented in phlix-server
+     * `CLAUDE.md`: the request callbacks flip a shared `done` flag and the loop
+     * yields (`usleep`) to the event loop until the response arrives or the
+     * timeout elapses. A closure `$transport` seam short-circuits this for tests.
+     *
+     * Returns the status code and body for EVERY HTTP response (including 4xx /
+     * 5xx) rather than throwing on error status — callers inspect the status.
+     * Only genuine transport failures (connection/timeout) throw.
+     *
+     * @param string                $method  HTTP method.
+     * @param string                $url     Absolute URL (or a path relative to API_BASE).
+     * @param array<string, string> $headers Request headers.
+     * @param string|null           $body    Raw request body (JSON), or null.
+     *
+     * @return array{status:int, body:string}
+     *
+     * @throws OpenSubtitlesException On transport/network failure.
+     */
+    private function httpRequest(string $method, string $url, array $headers = [], ?string $body = null): array
+    {
+        if (!str_starts_with($url, 'http://') && !str_starts_with($url, 'https://')) {
+            $url = self::API_BASE . ltrim($url, '/');
+        }
+
+        $headers = array_merge($this->defaultHeaders(), $headers);
+
+        if ($this->transport !== null) {
+            return ($this->transport)($method, $url, $headers, $body);
+        }
+
+        $state = ['status' => 0, 'body' => '', 'error' => null, 'done' => false];
+
+        $options = [
+            'method' => $method,
+            'headers' => $headers,
+            'success' => function (Response $response) use (&$state): void {
+                $state['status'] = $response->getStatusCode();
+                $state['body'] = $response->getBody()->getContents();
+                $state['done'] = true;
+            },
+            'error' => function (Throwable $e) use (&$state): void {
+                $state['error'] = $e;
+                $state['done'] = true;
+            },
+        ];
+
+        if ($body !== null) {
+            $options['data'] = $body;
+        }
+
+        $this->getHttpClient()->request($url, $options);
+
+        // Cooperative wait — yields to the event loop (Swoole coroutine hooks
+        // make usleep yield), allowing other tasks to proceed meanwhile.
+        $maxWait = self::HTTP_TIMEOUT_SEC + 1.0;
+        $waited = 0.0;
+        while (!$state['done'] && $waited < $maxWait) {
+            usleep(10_000); // 10ms
+            $waited += 0.01;
+        }
+
+        if ($state['error'] instanceof Throwable) {
+            throw new OpenSubtitlesException(
+                'HTTP request failed: ' . $state['error']->getMessage(),
+                0,
+                $state['error'],
+            );
+        }
+
+        if (!$state['done']) {
+            throw new OpenSubtitlesException('HTTP request timed out after ' . self::HTTP_TIMEOUT_SEC . 's');
+        }
+
+        return ['status' => $state['status'], 'body' => $state['body']];
+    }
+
+    /**
+     * Default headers sent on every request.
+     *
+     * @return array<string, string>
+     */
+    private function defaultHeaders(): array
+    {
+        return [
+            'Api-Key' => $this->apiKey,
+            'User-Agent' => 'Phlix-Plugin-OpenSubtitles/' . self::pluginVersion(),
+            'Accept' => 'application/json',
+        ];
+    }
+
+    /**
+     * Bearer-authorization header when a session token is present.
+     *
+     * @return array<string, string>
+     */
+    private function authHeaders(): array
+    {
+        return $this->sessionToken !== null
+            ? ['Authorization' => 'Bearer ' . $this->sessionToken]
+            : [];
+    }
+
+    /**
+     * Get or lazily create the shared non-blocking HTTP client.
+     */
+    private function getHttpClient(): Client
+    {
+        if ($this->httpClient === null) {
+            $this->httpClient = new Client(['timeout' => self::HTTP_TIMEOUT_SEC]);
+        }
+
+        return $this->httpClient;
+    }
+
+    /**
+     * Parse a filename to extract media information.
      *
      * @param string $filename The media filename to parse.
      *
@@ -778,18 +915,10 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             'year' => null,
         ];
 
-        // Try to match IMDB ID patterns like:
-        // - Movie.Name.2019.1080p.BluRay.x264-RARBG (no imdb)
-        // - Movie.Name.2019.1080p.BluRay.x264-RARBG.nfo (may have .nfo)
-        // - tt1234567 (direct IMDB ID format)
-        // We don't compute hash from here - that requires actual file access
-
-        // Match direct IMDB ID
         if (preg_match('/(tt\d{7,8})/i', $filename, $matches)) {
-            $result['imdb_id'] = strtoupper($matches[1]);
+            $result['imdb_id'] = strtolower($matches[1]);
         }
 
-        // Extract title and year if possible
         if (preg_match('/^(.+?)[.\\s]+(\\d{4})/', basename($filename), $yearMatches)) {
             $result['title'] = trim($yearMatches[1], '.[\\s');
             $result['year'] = (int) $yearMatches[2];
@@ -801,77 +930,20 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     /**
      * Filter subtitles to prefer the requested format.
      *
-     * The real OpenSubtitles v1 `/subtitles` search response is JSON:API shaped.
-     * Independently re-verified (not just trusting the prior investigation) against
-     * https://github.com/dusking/opensubtitles-com (`src/opensubtitlescom/responses.py`,
-     * the `Subtitle` class), https://apidog.com/blog/opensubtitles-api/, and the
-     * `odwrtw/opensubtitles` Go client's `File` struct — all three agree on the shape:
+     * The real OpenSubtitles v1 `/subtitles` search response is JSON:API shaped:
+     * `id` is a STRING, file info is under `attributes.files` (an ARRAY, each
+     * with `file_id`/`file_name`/`cd_number`), and `imdb_id` is nested under
+     * `attributes.feature_details.imdb_id` as a JSON NUMBER — see
+     * {@see normalizeImdbId()}. There is no per-file `format` attribute; the
+     * only signal is the extension in `file_name` (see {@see formatFromFilename()}).
      *
-     * ```json
-     * {
-     *   "id": "3634077",
-     *   "type": "subtitle",
-     *   "attributes": {
-     *     "language": "en",
-     *     "download_count": 5000,
-     *     "feature_details": { "imdb_id": 1234567 },
-     *     "files": [
-     *       { "file_id": 998877, "cd_number": 1, "file_name": "Movie.Name.2019.srt" }
-     *     ]
-     *   }
-     * }
-     * ```
-     *
-     * This fixes three latent shape mismatches, all in this one method:
-     *
-     * 1. `attributes.file` (singular) does not exist — the real key is
-     *    `attributes.files` (plural), an ARRAY. A single subtitle listing can carry
-     *    multiple files (e.g. one file per CD for old multi-CD releases), each with
-     *    its own `file_id`. The old code always saw an empty `$fileInfo` and silently
-     *    fabricated a generic filename/format for every result.
-     * 2. `download()` requires a `file_id` (see its docblock), which was never
-     *    extracted at all — nothing wired a real file_id from search into download,
-     *    so the search→download pipeline was dead end-to-end for every caller.
-     * 3. `id` is a JSON:API resource id: always a STRING (confirmed via the Go
-     *    client's `ID string \`json:"id"\`` and the apidog example `"id": "1234567"`),
-     *    never an int — the old `is_int($subtitle['id'])` check was always false
-     *    against the real API, so every result's `id` silently collapsed to `0`.
-     *    `imdb_id` is nested under `attributes.feature_details.imdb_id`, not
-     *    `attributes.imdb_id` directly — the old flat read always saw `null`.
-     * 4. `feature_details.imdb_id` is a JSON NUMBER (confirmed against the official
-     *    OpenSubtitles OpenAPI spec's `"imdb_id": {"type": "number"}`, the
-     *    `odwrtw/opensubtitles` Go client's `FeatureDetails.ImdbID int`, and the
-     *    official `opensubtitles/vlsub-opensubtitles-com` VLC plugin, which wraps it
-     *    in `tostring(details.imdb_id or "")` before display) — never a string. The
-     *    path fix in point 3 above still used `is_string()`, so `imdb_id` remained
-     *    `null` for every real response even after the path was corrected. See
-     *    {@see normalizeImdbId()}, which accepts the real numeric shape and
-     *    normalizes it to this codebase's `tt`-prefixed string convention (the shape
-     *    used everywhere else in phlix-server, e.g. `ImdbLookup`, `TmdbProvider`,
-     *    `MovieMetadataResolver`).
-     *
-     * There is no per-subtitle or per-file `format` attribute in the real API at
-     * all (verified absent from every reference client above); the only reliable
-     * signal is the file extension embedded in `file_name`, via
-     * {@see formatFromFilename()}.
-     *
-     * Multi-file (multi-CD) handling: rather than silently taking `files[0]` and
-     * discarding the rest (which would misrepresent a multi-part release as a
-     * single downloadable file) or exploding one API result into N synthetic
-     * search results (which would duplicate language/downloads/id across entries
-     * for what is really one release), each result keeps a `files` sub-array with
-     * every file's `file_id`/`file_name`/`cd_number`, plus a top-level `file_id`
-     * convenience alias for the first file — so a caller that only wants "the"
-     * file can use `file_id` directly, while a caller that needs to fetch every
-     * CD can iterate `files`.
-     *
-     * A subtitle entry with no usable file entries can never be downloaded (there
-     * is no `file_id` to pass to {@see download()}), so it is dropped rather than
-     * surfaced with a fake sentinel `file_id`.
+     * Each result keeps every file in a `files` sub-array plus a top-level
+     * `file_id` alias for the first file. Entries with no downloadable file are
+     * dropped (there would be no `file_id` to pass to {@see download()}).
      *
      * @param array<array<string, mixed>> $subtitles       Raw subtitles from API.
-     * @param string                      $preferredFormat Preferred format, used as a
-     *        fallback when the file name has no extension to derive one from.
+     * @param string                      $preferredFormat Fallback format when the
+     *        file name has no extension to derive one from.
      *
      * @return list<array{
      *     id: string,
@@ -953,15 +1025,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     /**
      * Derive a lowercase subtitle format from a file's extension.
      *
-     * The OpenSubtitles v1 search response has no per-subtitle or per-file
-     * `format` attribute (independently verified absent from the reference
-     * clients cited on {@see filterSubtitles()}) — the file extension embedded in
-     * `attributes.files[].file_name` is the only signal available.
-     *
      * @param string|null $filename Subtitle file name (e.g. "Movie.srt"), or null.
      *
-     * @return string|null Lowercase extension without the leading dot, or null if
-     *         the filename is null/empty or has no extension.
+     * @return string|null Lowercase extension without the leading dot, or null.
      *
      * @since 0.3.0
      */
@@ -980,25 +1046,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * Normalize a raw `feature_details.imdb_id` value to this codebase's
      * `tt`-prefixed IMDB id string convention.
      *
-     * The real OpenSubtitles v1 API returns `imdb_id` as a JSON NUMBER (e.g.
-     * `1234567`), confirmed against the official OpenAPI spec
-     * (`"imdb_id": {"type": "number"}`), the `odwrtw/opensubtitles` Go client
-     * (`FeatureDetails.ImdbID int`), and the official
-     * `opensubtitles/vlsub-opensubtitles-com` VLC plugin (which itself has to
-     * `tostring()` the value before display). A prior fix corrected the JSON
-     * *path* to `feature_details.imdb_id` but kept an `is_string()` check, so
-     * the field silently stayed `null` for every real (numeric) response.
-     *
-     * The bare number has no `tt` prefix and drops any leading zeros (e.g.
-     * `133093` for `tt0133093`), so it is re-padded to at least 7 digits and
-     * prefixed here to match the `tt\d{7,}` shape used everywhere else in
-     * Phlix (see `phlix-server`'s `ImdbLookup`, `TmdbProvider`,
-     * `MovieMetadataResolver`, etc. — all represent IMDB ids as a `tt`-prefixed
-     * string, never a bare number).
-     *
-     * A numeric string is also accepted, in case some API responses vary from
-     * the documented number type; anything else (missing, non-numeric, zero,
-     * or negative) is treated as "no IMDB id".
+     * The real API returns `imdb_id` as a JSON NUMBER (e.g. `133093` for
+     * `tt0133093`); it is re-padded to at least 7 digits and `tt`-prefixed.
      *
      * @param mixed $rawImdbId Raw `feature_details.imdb_id` value from the API.
      *
@@ -1022,25 +1071,37 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     }
 
     /**
-     * Compute the OpenSubtitles hash for a file.
+     * Compute the OpenSubtitles `moviehash` for a media file.
      *
-     * The hash is computed from the first 64KB and last 64KB of the file,
-     * combined with the file size.
+     * This is the standard OpenSubtitles hash (a.k.a. OSDb hash): a 64-bit
+     * value formed by summing, modulo 2^64, the file size with every 8-byte
+     * little-endian word of the first 64 KiB and the last 64 KiB of the file.
+     * It is rendered as a 16-character, zero-padded, lowercase hex string.
+     *
+     * It is NOT a cryptographic digest — it deliberately ignores the middle of
+     * the file so that two identical media files hash identically without
+     * reading gigabytes. Reference & test vectors:
+     * https://trac.opensubtitles.org/projects/opensubtitles/wiki/HashSourceCodes
+     * (e.g. breakdance.avi, size 12909756 → `8e245d9679d31e12`).
+     *
+     * 64-bit unsigned arithmetic is done with split 32-bit halves so it is exact
+     * on any platform and never promotes to float on overflow.
      *
      * @param string $filePath Absolute path to the media file.
      *
-     * @return string Hex-encoded hash string, or empty string on error.
+     * @return string 16-char lowercase hex `moviehash`, or '' when the file is
+     *         missing, unreadable, or smaller than one 64 KiB chunk.
      *
-     * @since 0.1.0
+     * @since 0.4.0
      */
-    public static function computeHash(string $filePath): string
+    public static function computeMovieHash(string $filePath): string
     {
         if (!is_file($filePath) || !is_readable($filePath)) {
             return '';
         }
 
         $size = filesize($filePath);
-        if ($size === false || $size <= 0) {
+        if ($size === false || $size < self::HASH_CHUNK_SIZE) {
             return '';
         }
 
@@ -1049,22 +1110,37 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             return '';
         }
 
-        // Read first 64KB
-        $firstChunk = fread($handle, 65536);
-        fseek($handle, max(0, $size - 65536));
+        // Seed the accumulator with the file size, split into 32-bit halves.
+        $low = $size & 0xFFFFFFFF;
+        $high = ($size >> 32) & 0xFFFFFFFF;
 
-        // Read last 64KB
-        $lastChunk = fread($handle, 65536);
+        $firstChunk = fread($handle, self::HASH_CHUNK_SIZE);
+        fseek($handle, max(0, $size - self::HASH_CHUNK_SIZE), SEEK_SET);
+        $lastChunk = fread($handle, self::HASH_CHUNK_SIZE);
         fclose($handle);
 
-        if ($firstChunk === false || $lastChunk === false) {
+        if (
+            $firstChunk === false || $lastChunk === false
+            || strlen($firstChunk) < self::HASH_CHUNK_SIZE
+            || strlen($lastChunk) < self::HASH_CHUNK_SIZE
+        ) {
             return '';
         }
 
-        // Compute hash: size + first_chunk + last_chunk
-        $hash = hash('sha256', $size . $firstChunk . $lastChunk, true);
+        foreach ([$firstChunk, $lastChunk] as $chunk) {
+            /** @var array<int, int> $words 1-indexed unsigned 32-bit little-endian words. */
+            $words = unpack('V*', $chunk);
+            $count = count($words);
 
-        return bin2hex($hash);
+            for ($i = 1; $i + 1 <= $count; $i += 2) {
+                $low += $words[$i];
+                $high += $words[$i + 1] + ($low >> 32);
+                $low &= 0xFFFFFFFF;
+                $high &= 0xFFFFFFFF;
+            }
+        }
+
+        return sprintf('%08x%08x', $high, $low);
     }
 
     /**

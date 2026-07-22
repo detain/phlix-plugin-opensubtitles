@@ -1,6 +1,6 @@
 {
     "name": "phlix-plugin-opensubtitles",
-    "version": "0.3.2",
+    "version": "0.4.0",
     "phlix_min_server_version": "1.2.0",
     "type": "subtitle-provider",
     "entry": "Phlix\\PluginOpenSubtitles\\OpenSubtitlesProvider",

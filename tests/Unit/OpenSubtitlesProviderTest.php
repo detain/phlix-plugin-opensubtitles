@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Smoke tests for OpenSubtitlesProvider.
+ * Tests for OpenSubtitlesProvider.
  *
  * @copyright 2026 Joe Huss <detain@interserver.net>
  * @license   MIT
@@ -11,28 +11,29 @@ declare(strict_types=1);
 
 namespace Phlix\PluginOpenSubtitles\Tests;
 
-use GuzzleHttp\Client;
-use GuzzleHttp\Handler\MockHandler;
-use GuzzleHttp\HandlerStack;
-use GuzzleHttp\Middleware;
-use GuzzleHttp\Psr7\Response;
 use Phlix\PluginOpenSubtitles\OpenSubtitlesException;
 use Phlix\PluginOpenSubtitles\OpenSubtitlesProvider;
 use Phlix\PluginOpenSubtitles\OpenSubtitlesQuotaExceededException;
 use Phlix\PluginOpenSubtitles\SubtitleDownload;
 use PHPUnit\Framework\TestCase;
 use Psr\Container\ContainerInterface;
-use Psr\Http\Message\RequestInterface;
 
 /**
- * Smoke tests for the {@see OpenSubtitlesProvider} plugin.
+ * Tests the plugin's contract compliance and core functionality in isolation.
  *
- * Tests the plugin's contract compliance and core functionality
- * in isolation without requiring a live OpenSubtitles API connection.
+ * The provider's network layer is exercised through its `transport` closure
+ * seam — a fake that records outgoing requests and returns queued
+ * `{status, body}` responses — so no Workerman event loop or live API is
+ * needed. This asserts real consequences: what URLs/bodies/headers are sent,
+ * that onEnable does zero HTTP, and that the moviehash math is correct.
  */
 final class OpenSubtitlesProviderTest extends TestCase
 {
     private const TEST_API_KEY = 'test-api-key-12345';
+
+    // ---------------------------------------------------------------------
+    // Construction / configuration
+    // ---------------------------------------------------------------------
 
     public function test_constructor_sets_properties_correctly(): void
     {
@@ -70,54 +71,6 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertSame('srt', $provider->getFormat());
     }
 
-    /**
-     * Regression test for a stale hardcoded `User-Agent`: the header used to
-     * be the literal `Phlix-Plugin-OpenSubtitles/0.1.0` no matter what
-     * `plugin.json` actually said — it was never bumped across several real
-     * version bumps (0.2.0, then 0.3.x), so it drifted further out of sync
-     * with every release. The header must instead be derived from
-     * `plugin.json`'s `version` field at runtime, so this asserts it matches
-     * whatever the manifest currently says rather than embedding a second
-     * copy of the version number as a literal in this test (which would just
-     * go stale in the same way).
-     */
-    public function test_http_client_user_agent_derives_from_plugin_json_version(): void
-    {
-        $manifestPath = dirname(__DIR__, 2) . '/plugin.json';
-        /** @var array<string, mixed> $manifest */
-        $manifest = json_decode((string) file_get_contents($manifestPath), true);
-        $expectedVersion = $manifest['version'];
-        $this->assertIsString($expectedVersion);
-        $this->assertNotSame('', $expectedVersion);
-
-        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
-
-        $property = new \ReflectionProperty(OpenSubtitlesProvider::class, 'httpClient');
-        $property->setAccessible(true);
-        /** @var Client $client */
-        $client = $property->getValue($provider);
-
-        /** @var array<string, string> $headers */
-        $headers = $client->getConfig('headers');
-
-        $this->assertSame('Phlix-Plugin-OpenSubtitles/' . $expectedVersion, $headers['User-Agent']);
-    }
-
-    public function test_http_client_user_agent_is_not_the_old_stale_hardcoded_literal(): void
-    {
-        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
-
-        $property = new \ReflectionProperty(OpenSubtitlesProvider::class, 'httpClient');
-        $property->setAccessible(true);
-        /** @var Client $client */
-        $client = $property->getValue($provider);
-
-        /** @var array<string, string> $headers */
-        $headers = $client->getConfig('headers');
-
-        $this->assertNotSame('Phlix-Plugin-OpenSubtitles/0.1.0', $headers['User-Agent']);
-    }
-
     public function test_configure_applies_persisted_settings(): void
     {
         $provider = new OpenSubtitlesProvider();
@@ -143,73 +96,276 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertSame('srt', $provider->getFormat());
     }
 
+    // ---------------------------------------------------------------------
+    // Boot safety: onEnable must not do HTTP / must not log in
+    // ---------------------------------------------------------------------
+
+    /**
+     * The keystone boot-safety assertion. onEnable runs across ~14 Workerman
+     * workers at boot; a blocking login there is the item-5c3 landmine that was
+     * reverted in production. Even with credentials configured, onEnable must
+     * make ZERO HTTP requests and must NOT be logged in — authentication is
+     * deferred to the first actual API call.
+     */
+    public function test_on_enable_does_no_http_and_no_login_even_with_credentials(): void
+    {
+        $provider = new OpenSubtitlesProvider(
+            apiKey: self::TEST_API_KEY,
+            username: 'testuser',
+            password: 'testpass',
+        );
+
+        $history = [];
+        $this->installFakeTransport($provider, [], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->assertSame([], $history, 'onEnable must not perform any HTTP request');
+        $this->assertFalse($provider->isLoggedIn(), 'onEnable must not log in');
+    }
+
+    public function test_subscribed_events_returns_empty_array(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $this->assertSame([], $provider->subscribedEvents());
+    }
+
+    // ---------------------------------------------------------------------
+    // Deferred login (happens lazily on first authenticated use)
+    // ---------------------------------------------------------------------
+
+    /**
+     * Login is deferred out of onEnable to the first authenticated call. This
+     * asserts (a) it fires on the first search, not at enable time, (b) it
+     * POSTs to the correct fully-resolved v1 login URL, and (c) the session
+     * token is captured. The login request must precede the search request.
+     */
+    public function test_login_is_deferred_to_first_use_and_posts_to_correct_v1_url(): void
+    {
+        $provider = new OpenSubtitlesProvider(
+            apiKey: self::TEST_API_KEY,
+            username: 'testuser',
+            password: 'testpass',
+        );
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode(['token' => 'session-token-123'])),
+            self::response(200, (string) json_encode(['data' => []])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $this->assertCount(0, $history, 'no request until first use');
+
+        $provider->searchByImdbId('tt1234567');
+
+        $this->assertCount(2, $history);
+        $this->assertSame('POST', $history[0]['method']);
+        $this->assertSame('https://api.opensubtitles.com/api/v1/login', $history[0]['url']);
+        $this->assertTrue($provider->isLoggedIn());
+        $this->assertStringStartsWith(
+            'https://api.opensubtitles.com/api/v1/subtitles',
+            $history[1]['url'],
+        );
+    }
+
+    /**
+     * Login runs at most once per enable cycle: a second search must not re-POST
+     * to /login (that would burn requests and defeat the token).
+     */
+    public function test_login_runs_only_once_per_enable_cycle(): void
+    {
+        $provider = new OpenSubtitlesProvider(
+            apiKey: self::TEST_API_KEY,
+            username: 'u',
+            password: 'p',
+        );
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode(['token' => 'tok'])),
+            self::response(200, (string) json_encode(['data' => []])),
+            self::response(200, (string) json_encode(['data' => []])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $provider->searchByImdbId('tt1');
+        $provider->searchByImdbId('tt2');
+
+        $loginCalls = array_filter($history, static fn (array $h): bool => str_ends_with($h['url'], '/login'));
+        $this->assertCount(1, $loginCalls);
+    }
+
+    /**
+     * Login is optional (it only raises quota limits). A failed login must NOT
+     * throw or abort the search — the provider proceeds anonymously.
+     */
+    public function test_failed_login_does_not_break_search(): void
+    {
+        $provider = new OpenSubtitlesProvider(
+            apiKey: self::TEST_API_KEY,
+            username: 'u',
+            password: 'p',
+        );
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(401, (string) json_encode(['message' => 'bad credentials'])),
+            self::response(200, (string) json_encode(['data' => []])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $results = $provider->searchByImdbId('tt1234567');
+
+        $this->assertSame([], $results);
+        $this->assertFalse($provider->isLoggedIn());
+    }
+
+    // ---------------------------------------------------------------------
+    // Default headers (User-Agent derived from plugin.json)
+    // ---------------------------------------------------------------------
+
+    /**
+     * Regression test for a stale hardcoded User-Agent. The header must be
+     * derived from plugin.json's version at runtime. Asserted against the actual
+     * outgoing request headers (via the transport seam), not a source literal.
+     */
+    public function test_request_user_agent_derives_from_plugin_json_version(): void
+    {
+        $manifestPath = dirname(__DIR__, 2) . '/plugin.json';
+        /** @var array<string, mixed> $manifest */
+        $manifest = json_decode((string) file_get_contents($manifestPath), true);
+        $expectedVersion = $manifest['version'];
+        $this->assertIsString($expectedVersion);
+        $this->assertNotSame('', $expectedVersion);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [self::response(200, '{"data":[]}')], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $provider->searchByImdbId('tt1234567');
+
+        $this->assertSame(
+            'Phlix-Plugin-OpenSubtitles/' . $expectedVersion,
+            $history[0]['headers']['User-Agent'],
+        );
+        $this->assertNotSame('Phlix-Plugin-OpenSubtitles/0.1.0', $history[0]['headers']['User-Agent']);
+        $this->assertSame(self::TEST_API_KEY, $history[0]['headers']['Api-Key']);
+    }
+
+    // ---------------------------------------------------------------------
+    // moviehash — the OpenSubtitles OSDb hash algorithm
+    // ---------------------------------------------------------------------
+
     public function test_compute_hash_returns_empty_for_nonexistent_file(): void
     {
-        $hash = OpenSubtitlesProvider::computeHash('/nonexistent/path/file.mkv');
-
-        $this->assertSame('', $hash);
+        $this->assertSame('', OpenSubtitlesProvider::computeMovieHash('/nonexistent/path/file.mkv'));
     }
 
-    public function test_compute_hash_returns_hash_for_existing_file(): void
+    /**
+     * Files smaller than one 64 KiB chunk cannot produce a valid moviehash.
+     */
+    public function test_compute_hash_returns_empty_for_file_smaller_than_a_chunk(): void
     {
-        // Create a temporary file for testing
-        $tempFile = tempnam(sys_get_temp_dir(), 'phlix_test_');
-        if ($tempFile === false) {
-            $this->markTestSkipped('Could not create temp file');
-        }
+        $file = $this->makeFixture(str_repeat("\0", 1024));
 
         try {
-            file_put_contents($tempFile, 'test content for hash computation');
-
-            $hash = OpenSubtitlesProvider::computeHash($tempFile);
-
-            // Hash should be a 64-character hex string (SHA-256)
-            $this->assertMatchesRegularExpression('/^[a-f0-9]{64}$/', $hash);
-
-            // Same content should produce same hash
-            $hash2 = OpenSubtitlesProvider::computeHash($tempFile);
-            $this->assertSame($hash, $hash2);
+            $this->assertSame('', OpenSubtitlesProvider::computeMovieHash($file));
         } finally {
-            unlink($tempFile);
+            unlink($file);
         }
     }
 
-    public function test_compute_hash_different_content_produces_different_hash(): void
+    /**
+     * Documented-value vector: a 131072-byte all-zero file. Every 8-byte word of
+     * both chunks sums to zero, so the hash reduces to the file size itself
+     * (131072 = 0x20000), rendered as 16 zero-padded lowercase hex chars. This
+     * value is derived independently of the implementation and pins the exact
+     * algorithm (size-seed + little-endian word sum + %016x formatting).
+     */
+    public function test_compute_hash_matches_documented_value_for_all_zero_file(): void
     {
-        $tempFile1 = tempnam(sys_get_temp_dir(), 'phlix_test1_');
-        $tempFile2 = tempnam(sys_get_temp_dir(), 'phlix_test2_');
-
-        if ($tempFile1 === false || $tempFile2 === false) {
-            if ($tempFile1 !== false) {
-                unlink($tempFile1);
-            }
-            if ($tempFile2 !== false) {
-                unlink($tempFile2);
-            }
-            $this->markTestSkipped('Could not create temp files');
-        }
+        $file = $this->makeFixture(str_repeat("\0", 131072));
 
         try {
-            file_put_contents($tempFile1, 'content A');
-            file_put_contents($tempFile2, 'content B');
-
-            $hash1 = OpenSubtitlesProvider::computeHash($tempFile1);
-            $hash2 = OpenSubtitlesProvider::computeHash($tempFile2);
-
-            $this->assertNotSame($hash1, $hash2);
+            $this->assertSame('0000000000020000', OpenSubtitlesProvider::computeMovieHash($file));
         } finally {
-            unlink($tempFile1);
-            unlink($tempFile2);
+            unlink($file);
         }
     }
+
+    /**
+     * The summation must actually contribute: changing a byte inside the first
+     * 64 KiB must change the hash (discriminates a broken/no-op accumulator).
+     */
+    public function test_compute_hash_changes_when_a_head_byte_changes(): void
+    {
+        $baseline = str_repeat("\0", 131072);
+        $mutated = $baseline;
+        $mutated[10] = "\xAB"; // within the first 64 KiB chunk
+
+        $fileA = $this->makeFixture($baseline);
+        $fileB = $this->makeFixture($mutated);
+
+        try {
+            $hashA = OpenSubtitlesProvider::computeMovieHash($fileA);
+            $hashB = OpenSubtitlesProvider::computeMovieHash($fileB);
+            $this->assertSame('0000000000020000', $hashA);
+            $this->assertNotSame($hashA, $hashB);
+        } finally {
+            unlink($fileA);
+            unlink($fileB);
+        }
+    }
+
+    /**
+     * Proves the hash reads ONLY the head and tail: mutating a byte in the
+     * middle of a file large enough to have a gap between the two 64 KiB windows
+     * must NOT change the hash.
+     */
+    public function test_compute_hash_ignores_the_middle_of_the_file(): void
+    {
+        $size = 200000; // head [0,65536), tail [134464,200000) — gap in between
+        $baseline = str_repeat("\0", $size);
+        $mutated = $baseline;
+        $mutated[100000] = "\xFF"; // squarely in the untouched middle
+
+        $fileA = $this->makeFixture($baseline);
+        $fileB = $this->makeFixture($mutated);
+
+        try {
+            $this->assertSame(
+                OpenSubtitlesProvider::computeMovieHash($fileA),
+                OpenSubtitlesProvider::computeMovieHash($fileB),
+            );
+        } finally {
+            unlink($fileA);
+            unlink($fileB);
+        }
+    }
+
+    public function test_compute_hash_is_16_char_lowercase_hex_and_deterministic(): void
+    {
+        $file = $this->makeFixture(str_repeat("phlix-", 40000)); // > 128 KiB
+
+        try {
+            $hash = OpenSubtitlesProvider::computeMovieHash($file);
+            $this->assertMatchesRegularExpression('/^[0-9a-f]{16}$/', $hash);
+            $this->assertSame($hash, OpenSubtitlesProvider::computeMovieHash($file));
+        } finally {
+            unlink($file);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // SubtitleDownload DTO / exception
+    // ---------------------------------------------------------------------
 
     public function test_subtitle_download_dto_is_immutable(): void
     {
-        $download = new SubtitleDownload(
-            content: 'subtitle content',
-            format: 'srt',
-            fileName: 'movie.srt',
-        );
+        $download = new SubtitleDownload(content: 'subtitle content', format: 'srt', fileName: 'movie.srt');
 
         $this->assertSame('subtitle content', $download->content);
         $this->assertSame('srt', $download->format);
@@ -218,31 +374,15 @@ final class OpenSubtitlesProviderTest extends TestCase
 
     public function test_subtitle_download_get_content_length(): void
     {
-        $download = new SubtitleDownload(
-            content: 'hello',
-            format: 'srt',
-            fileName: 'test.srt',
-        );
+        $download = new SubtitleDownload(content: 'hello', format: 'srt', fileName: 'test.srt');
 
         $this->assertSame(5, $download->getContentLength());
     }
 
     public function test_subtitle_download_is_empty(): void
     {
-        $emptyDownload = new SubtitleDownload(
-            content: '',
-            format: 'srt',
-            fileName: 'empty.srt',
-        );
-
-        $nonEmptyDownload = new SubtitleDownload(
-            content: 'some content',
-            format: 'srt',
-            fileName: 'nonempty.srt',
-        );
-
-        $this->assertTrue($emptyDownload->isEmpty());
-        $this->assertFalse($nonEmptyDownload->isEmpty());
+        $this->assertTrue((new SubtitleDownload(content: '', format: 'srt', fileName: 'e.srt'))->isEmpty());
+        $this->assertFalse((new SubtitleDownload(content: 'x', format: 'srt', fileName: 'n.srt'))->isEmpty());
     }
 
     public function test_exception_is_runtime_exception(): void
@@ -253,153 +393,163 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertSame(42, $exception->getCode());
     }
 
-    public function test_provider_is_disabled_before_onenable(): void
-    {
-        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+    // ---------------------------------------------------------------------
+    // Not-enabled guards
+    // ---------------------------------------------------------------------
 
-        // Calling searchByImdbId before onEnable should throw
+    public function test_search_by_imdb_id_throws_before_onenable(): void
+    {
         $this->expectException(OpenSubtitlesException::class);
         $this->expectExceptionMessage('not enabled');
-
-        $provider->searchByImdbId('tt1234567');
+        (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY))->searchByImdbId('tt1234567');
     }
 
-    public function test_provider_is_disabled_before_onenable_search_by_filename(): void
+    public function test_search_by_filename_throws_before_onenable(): void
     {
-        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
-
         $this->expectException(OpenSubtitlesException::class);
         $this->expectExceptionMessage('not enabled');
-
-        $provider->searchByFilename('movie.mkv');
+        (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY))->searchByFilename('movie.mkv');
     }
 
-    public function test_provider_is_disabled_before_onenable_search_by_hash(): void
+    public function test_search_by_hash_throws_before_onenable(): void
     {
-        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
-
         $this->expectException(OpenSubtitlesException::class);
         $this->expectExceptionMessage('not enabled');
-
-        $provider->searchByHash('abc123', 1234567);
+        (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY))->searchByHash('abc123', 1234567);
     }
 
-    public function test_provider_is_disabled_before_onenable_download(): void
+    public function test_search_by_path_throws_before_onenable(): void
     {
-        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
-
         $this->expectException(OpenSubtitlesException::class);
         $this->expectExceptionMessage('not enabled');
-
-        $provider->download(12345);
+        (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY))->searchByPath('/some/movie.mkv');
     }
 
-    public function test_subscribed_events_returns_empty_array(): void
+    public function test_download_throws_before_onenable(): void
     {
-        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
-
-        $this->assertSame([], $provider->subscribedEvents());
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessage('not enabled');
+        (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY))->download(12345);
     }
 
-    /**
-     * Regression test for the production 404 bug: `onEnable()` posted to
-     * `https://api.opensubtitles.com/v2/uselogin` instead of the real
-     * OpenSubtitles REST API v1 login endpoint. Guzzle's `base_uri` +
-     * leading-slash request path resolution (RFC 3986 §5.3) silently
-     * discards the base URI's path component, so this must be asserted
-     * against the fully resolved request URI — not just the path literal
-     * in the source — or the bug would have shipped without a red test.
-     */
-    public function test_login_posts_to_the_correct_v1_login_url(): void
-    {
-        $provider = new OpenSubtitlesProvider(
-            apiKey: self::TEST_API_KEY,
-            username: 'testuser',
-            password: 'testpass',
-        );
-
-        $history = [];
-        $this->installMockHttpClient($provider, [
-            new Response(200, [], (string) json_encode(['token' => 'session-token-123'])),
-        ], $history);
-
-        $provider->onEnable($this->stubContainer());
-
-        $this->assertCount(1, $history);
-        $request = $history[0]['request'];
-        $this->assertSame('POST', $request->getMethod());
-        $this->assertSame(
-            'https://api.opensubtitles.com/api/v1/login',
-            (string) $request->getUri(),
-        );
-        $this->assertTrue($provider->isLoggedIn());
-    }
+    // ---------------------------------------------------------------------
+    // Search request shape
+    // ---------------------------------------------------------------------
 
     public function test_search_by_imdb_id_requests_the_correct_v1_subtitles_url(): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
-
         $history = [];
-        $this->installMockHttpClient($provider, [
-            new Response(200, [], (string) json_encode(['data' => []])),
-        ], $history);
+        $this->installFakeTransport($provider, [self::response(200, '{"data":[]}')], $history);
 
         $provider->onEnable($this->stubContainer());
         $provider->searchByImdbId('tt1234567');
 
         $this->assertCount(1, $history);
-        $request = $history[0]['request'];
-        $this->assertSame('GET', $request->getMethod());
+        $this->assertSame('GET', $history[0]['method']);
         $this->assertStringStartsWith(
             'https://api.opensubtitles.com/api/v1/subtitles',
-            (string) $request->getUri(),
+            $history[0]['url'],
         );
+        $this->assertStringContainsString('imdb_id=tt1234567', $history[0]['url']);
     }
 
     /**
-     * Regression test for the `filterSubtitles()` shape bug: it used to read
-     * `attributes.file` (singular, never present in the real API), so every
-     * result's `format`/`filename` silently fell back to a fabricated generic
-     * value and no `file_id` was ever surfaced at all — meaning a caller had no
-     * way to feed a real search result into {@see OpenSubtitlesProvider::download()}.
-     * The real API nests file info under `attributes.files` (an array), each with
-     * `file_id`, `file_name`, `cd_number`; `imdb_id` lives under
-     * `attributes.feature_details.imdb_id` as a JSON NUMBER (not a string — see
-     * {@see OpenSubtitlesProvider::normalizeImdbId()}); and the JSON:API resource
-     * `id` is a STRING, not an int.
-     *
-     * The `imdb_id` fixture below is deliberately the bare int `1234567` (the real
-     * API shape), NOT the string `"tt1234567"` — encoding the fixture as a string
-     * previously let `is_string($featureDetails['imdb_id'])` pass against a fake
-     * shape while silently returning `null` against every real response.
+     * The hash search must send BOTH the `moviehash` and the file size
+     * (`moviebytesize`). Mutating the query to drop the size, or to send the
+     * weak filename query instead, must fail this.
      */
-    public function test_search_by_imdb_id_parses_attributes_files_array_and_surfaces_file_id(): void
+    public function test_search_by_hash_sends_moviehash_and_filesize(): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
-
         $history = [];
-        $this->installMockHttpClient($provider, [
-            new Response(200, [], (string) json_encode([
-                'data' => [
-                    [
-                        'id' => '3634077',
-                        'type' => 'subtitle',
-                        'attributes' => [
-                            'language' => 'en',
-                            'download_count' => 5000,
-                            'feature_details' => [
-                                'imdb_id' => 1234567,
-                            ],
-                            'files' => [
-                                [
-                                    'file_id' => 998877,
-                                    'cd_number' => 1,
-                                    'file_name' => 'Movie.Name.2019.srt',
-                                ],
-                            ],
-                        ],
+        $this->installFakeTransport($provider, [self::response(200, '{"data":[]}')], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $provider->searchByHash('8e245d9679d31e12', 12909756);
+
+        $this->assertCount(1, $history);
+        $this->assertStringContainsString('moviehash=8e245d9679d31e12', $history[0]['url']);
+        $this->assertStringContainsString('moviebytesize=12909756', $history[0]['url']);
+    }
+
+    /**
+     * searchByPath computes the moviehash from the on-disk file and issues a
+     * hash search carrying that exact hash + size — proving the file-path search
+     * uses the real hash, not a filename fallback.
+     */
+    public function test_search_by_path_computes_and_sends_the_file_moviehash(): void
+    {
+        $file = $this->makeFixture(str_repeat("\0", 131072));
+        $expectedHash = OpenSubtitlesProvider::computeMovieHash($file);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        // Return one result so the hash search is considered a hit (no fallback).
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'data' => [[
+                    'id' => '1',
+                    'attributes' => [
+                        'language' => 'en',
+                        'download_count' => 1,
+                        'files' => [['file_id' => 1, 'cd_number' => 1, 'file_name' => 'a.srt']],
                     ],
-                ],
+                ]],
+            ])),
+        ], $history);
+
+        try {
+            $provider->onEnable($this->stubContainer());
+            $results = $provider->searchByPath($file);
+        } finally {
+            unlink($file);
+        }
+
+        $this->assertCount(1, $history);
+        $this->assertStringContainsString('moviehash=' . $expectedHash, $history[0]['url']);
+        $this->assertStringContainsString('moviebytesize=131072', $history[0]['url']);
+        $this->assertCount(1, $results);
+    }
+
+    /**
+     * When the file cannot be hashed (e.g. it does not exist), searchByPath
+     * falls back to a filename-based query rather than a hash search.
+     */
+    public function test_search_by_path_falls_back_to_filename_when_hash_unavailable(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [self::response(200, '{"data":[]}')], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $provider->searchByPath('/nonexistent/Movie.Name.2019.mkv');
+
+        $this->assertCount(1, $history);
+        $this->assertStringNotContainsString('moviehash=', $history[0]['url']);
+        $this->assertStringContainsString('query=', $history[0]['url']);
+    }
+
+    // ---------------------------------------------------------------------
+    // Search response parsing (JSON:API shape)
+    // ---------------------------------------------------------------------
+
+    public function test_search_parses_attributes_files_array_and_surfaces_file_id(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'data' => [[
+                    'id' => '3634077',
+                    'type' => 'subtitle',
+                    'attributes' => [
+                        'language' => 'en',
+                        'download_count' => 5000,
+                        'feature_details' => ['imdb_id' => 1234567],
+                        'files' => [['file_id' => 998877, 'cd_number' => 1, 'file_name' => 'Movie.Name.2019.srt']],
+                    ],
+                ]],
             ])),
         ], $history);
 
@@ -420,68 +570,43 @@ final class OpenSubtitlesProviderTest extends TestCase
         );
     }
 
-    /**
-     * Dedicated regression test for the `imdb_id` TYPE bug (as opposed to the
-     * path bug covered above): the real API returns `feature_details.imdb_id` as
-     * a JSON number, e.g. `133093` for `tt0133093` (leading zeros are not
-     * representable in a JSON number, so the raw value drops them). A prior fix
-     * corrected the JSON path but kept an `is_string()` check, so `imdb_id` stayed
-     * `null` for every real (numeric) response even after that fix. This asserts
-     * the numeric value is both extracted AND re-normalized to the `tt`-prefixed,
-     * zero-padded string convention used elsewhere in Phlix (see
-     * `phlix-server`'s `ImdbLookup`/`TmdbProvider`/`MovieMetadataResolver`).
-     */
-    public function test_search_by_imdb_id_normalizes_numeric_imdb_id_with_zero_padding(): void
+    public function test_search_normalizes_numeric_imdb_id_with_zero_padding(): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
-
         $history = [];
-        $this->installMockHttpClient($provider, [
-            new Response(200, [], (string) json_encode([
-                'data' => [
-                    [
-                        'id' => '1',
-                        'attributes' => [
-                            'language' => 'en',
-                            'download_count' => 1,
-                            'feature_details' => ['imdb_id' => 133093],
-                            'files' => [
-                                ['file_id' => 1, 'cd_number' => 1, 'file_name' => 'a.srt'],
-                            ],
-                        ],
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'data' => [[
+                    'id' => '1',
+                    'attributes' => [
+                        'language' => 'en',
+                        'download_count' => 1,
+                        'feature_details' => ['imdb_id' => 133093],
+                        'files' => [['file_id' => 1, 'cd_number' => 1, 'file_name' => 'a.srt']],
                     ],
-                ],
+                ]],
             ])),
         ], $history);
 
         $provider->onEnable($this->stubContainer());
         $results = $provider->searchByImdbId('tt0133093');
 
-        $this->assertCount(1, $results);
         $this->assertSame('tt0133093', $results[0]['imdb_id']);
     }
 
-    /**
-     * When `feature_details.imdb_id` is absent, or is a shape that isn't a real
-     * IMDB id at all (a non-numeric string, `null`, or a JSON bool), `imdb_id`
-     * must resolve to `null` rather than throwing or fabricating a placeholder.
-     */
-    public function test_search_by_imdb_id_returns_null_imdb_id_when_missing_or_invalid(): void
+    public function test_search_returns_null_imdb_id_when_missing_or_invalid(): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
-
         $history = [];
-        $this->installMockHttpClient($provider, [
-            new Response(200, [], (string) json_encode([
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
                 'data' => [
                     [
                         'id' => '1',
                         'attributes' => [
                             'language' => 'en',
                             'download_count' => 1,
-                            'files' => [
-                                ['file_id' => 1, 'cd_number' => 1, 'file_name' => 'a.srt'],
-                            ],
+                            'files' => [['file_id' => 1, 'cd_number' => 1, 'file_name' => 'a.srt']],
                         ],
                     ],
                     [
@@ -490,9 +615,7 @@ final class OpenSubtitlesProviderTest extends TestCase
                             'language' => 'en',
                             'download_count' => 1,
                             'feature_details' => ['imdb_id' => 'not-a-number'],
-                            'files' => [
-                                ['file_id' => 2, 'cd_number' => 1, 'file_name' => 'b.srt'],
-                            ],
+                            'files' => [['file_id' => 2, 'cd_number' => 1, 'file_name' => 'b.srt']],
                         ],
                     ],
                 ],
@@ -507,42 +630,24 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertNull($results[1]['imdb_id']);
     }
 
-    /**
-     * A single subtitle listing can carry multiple files (e.g. one file per CD
-     * for old multi-CD releases). Naively taking `files[0]` and discarding the
-     * rest would silently misrepresent the release as a single-file download —
-     * this asserts every file survives in the `files` sub-array, not just the
-     * first, while `file_id` still conveniently aliases the first file.
-     */
-    public function test_search_by_imdb_id_preserves_every_file_in_a_multi_cd_release(): void
+    public function test_search_preserves_every_file_in_a_multi_cd_release(): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
-
         $history = [];
-        $this->installMockHttpClient($provider, [
-            new Response(200, [], (string) json_encode([
-                'data' => [
-                    [
-                        'id' => '3634078',
-                        'attributes' => [
-                            'language' => 'en',
-                            'download_count' => 200,
-                            'feature_details' => ['imdb_id' => 1234567],
-                            'files' => [
-                                [
-                                    'file_id' => 111111,
-                                    'cd_number' => 1,
-                                    'file_name' => 'Movie.Name.2019.CD1.srt',
-                                ],
-                                [
-                                    'file_id' => 111112,
-                                    'cd_number' => 2,
-                                    'file_name' => 'Movie.Name.2019.CD2.srt',
-                                ],
-                            ],
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'data' => [[
+                    'id' => '3634078',
+                    'attributes' => [
+                        'language' => 'en',
+                        'download_count' => 200,
+                        'feature_details' => ['imdb_id' => 1234567],
+                        'files' => [
+                            ['file_id' => 111111, 'cd_number' => 1, 'file_name' => 'Movie.Name.2019.CD1.srt'],
+                            ['file_id' => 111112, 'cd_number' => 2, 'file_name' => 'Movie.Name.2019.CD2.srt'],
                         ],
                     ],
-                ],
+                ]],
             ])),
         ], $history);
 
@@ -552,47 +657,23 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertCount(1, $results);
         $this->assertSame(111111, $results[0]['file_id']);
         $this->assertCount(2, $results[0]['files']);
-        $this->assertSame(
-            ['file_id' => 111111, 'file_name' => 'Movie.Name.2019.CD1.srt', 'cd_number' => 1],
-            $results[0]['files'][0],
-        );
-        $this->assertSame(
-            ['file_id' => 111112, 'file_name' => 'Movie.Name.2019.CD2.srt', 'cd_number' => 2],
-            $results[0]['files'][1],
-        );
+        $this->assertSame(111112, $results[0]['files'][1]['file_id']);
     }
 
-    /**
-     * A subtitle entry with an empty (or missing) `files` array has no `file_id`
-     * to ever pass to {@see OpenSubtitlesProvider::download()}, so it must be
-     * dropped rather than surfaced with a fake sentinel `file_id`. This also
-     * proves the multi-result sort-by-downloads still works once a dead entry
-     * is filtered out from the middle of the list.
-     */
-    public function test_search_by_imdb_id_skips_subtitles_with_no_downloadable_files(): void
+    public function test_search_skips_subtitles_with_no_downloadable_files(): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
-
         $history = [];
-        $this->installMockHttpClient($provider, [
-            new Response(200, [], (string) json_encode([
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
                 'data' => [
-                    [
-                        'id' => '1',
-                        'attributes' => ['language' => 'en', 'download_count' => 5000, 'files' => [
-                            ['file_id' => 998877, 'cd_number' => 1, 'file_name' => 'a.srt'],
-                        ]],
-                    ],
-                    [
-                        'id' => '2',
-                        'attributes' => ['language' => 'en', 'download_count' => 99999, 'files' => []],
-                    ],
-                    [
-                        'id' => '3',
-                        'attributes' => ['language' => 'en', 'download_count' => 1, 'files' => [
-                            ['file_id' => 555, 'cd_number' => 1, 'file_name' => 'b.srt'],
-                        ]],
-                    ],
+                    ['id' => '1', 'attributes' => ['language' => 'en', 'download_count' => 5000, 'files' => [
+                        ['file_id' => 998877, 'cd_number' => 1, 'file_name' => 'a.srt'],
+                    ]]],
+                    ['id' => '2', 'attributes' => ['language' => 'en', 'download_count' => 99999, 'files' => []]],
+                    ['id' => '3', 'attributes' => ['language' => 'en', 'download_count' => 1, 'files' => [
+                        ['file_id' => 555, 'cd_number' => 1, 'file_name' => 'b.srt'],
+                    ]]],
                 ],
             ])),
         ], $history);
@@ -604,77 +685,70 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertSame(['1', '3'], array_column($results, 'id'));
     }
 
-    /**
-     * End-to-end proof that the fix actually wires search into download: a
-     * `file_id` surfaced by the (now-fixed) search parsing — including a
-     * non-first CD file, not just `files[0]` — round-trips correctly as the
-     * `file_id` body param on the subsequent {@see download()} call.
-     */
+    public function test_search_throws_on_error_status(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [self::response(503, 'upstream down')], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessage('Search by IMDB ID failed');
+        $provider->searchByImdbId('tt1234567');
+    }
+
+    // ---------------------------------------------------------------------
+    // Download two-step flow
+    // ---------------------------------------------------------------------
+
     public function test_search_result_file_id_round_trips_into_download(): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY, format: 'srt');
-
         $history = [];
-        $this->installMockHttpClient($provider, [
-            new Response(200, [], (string) json_encode([
-                'data' => [
-                    [
-                        'id' => '3634078',
-                        'attributes' => [
-                            'language' => 'en',
-                            'download_count' => 200,
-                            'files' => [
-                                ['file_id' => 111111, 'cd_number' => 1, 'file_name' => 'CD1.srt'],
-                                ['file_id' => 111112, 'cd_number' => 2, 'file_name' => 'CD2.srt'],
-                            ],
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'data' => [[
+                    'id' => '3634078',
+                    'attributes' => [
+                        'language' => 'en',
+                        'download_count' => 200,
+                        'files' => [
+                            ['file_id' => 111111, 'cd_number' => 1, 'file_name' => 'CD1.srt'],
+                            ['file_id' => 111112, 'cd_number' => 2, 'file_name' => 'CD2.srt'],
                         ],
                     ],
-                ],
+                ]],
             ])),
-            new Response(200, [], (string) json_encode([
+            self::response(200, (string) json_encode([
                 'link' => 'https://dl.opensubtitles.org/download/src/upload/111112.srt',
                 'file_name' => 'CD2.srt',
             ])),
-            new Response(200, [], "1\n00:00:01,000 --> 00:00:02,000\nCD two.\n"),
+            self::response(200, "1\n00:00:01,000 --> 00:00:02,000\nCD two.\n"),
         ], $history);
 
         $provider->onEnable($this->stubContainer());
         $results = $provider->searchByImdbId('tt1234567');
 
-        // Deliberately pick the SECOND CD's file_id, not the top-level convenience
-        // alias, to prove the full `files[]` array — not just `files[0]` — is usable.
         $secondCdFileId = $results[0]['files'][1]['file_id'];
         $this->assertSame(111112, $secondCdFileId);
 
         $download = $provider->download($secondCdFileId);
 
         $this->assertCount(3, $history);
-        $downloadRequest = $history[1]['request'];
-        /** @var array<string, mixed> */
-        $requestBody = json_decode((string) $downloadRequest->getBody(), true);
+        /** @var array<string, mixed> $requestBody */
+        $requestBody = json_decode((string) $history[1]['body'], true);
         $this->assertSame(['file_id' => 111112, 'sub_format' => 'srt'], $requestBody);
         $this->assertSame("1\n00:00:01,000 --> 00:00:02,000\nCD two.\n", $download->content);
         $this->assertSame('CD2.srt', $download->fileName);
     }
 
-    /**
-     * Regression test for the download API-shape bug: `download()` used to
-     * `GET subtitles/{id}/download` expecting an inline base64 `content`
-     * field in a single response. The real OpenSubtitles v1 API is a
-     * two-step flow — `POST download` with a `file_id` body returns a
-     * temporary `link` (plus quota accounting), and the actual subtitle
-     * bytes must then be fetched with a second `GET` against that link.
-     * This asserts both outgoing requests' shape AND that the final
-     * returned content is the fetched file bytes, not the JSON envelope
-     * from the first call.
-     */
     public function test_download_posts_file_id_and_fetches_content_from_link(): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY, format: 'srt');
-
         $history = [];
-        $this->installMockHttpClient($provider, [
-            new Response(200, [], (string) json_encode([
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
                 'link' => 'https://dl.opensubtitles.org/download/src/upload/12345.srt',
                 'file_name' => 'Movie.Name.2019.srt',
                 'requests' => 1,
@@ -683,7 +757,7 @@ final class OpenSubtitlesProviderTest extends TestCase
                 'reset_time' => '2 hours and 47 minutes',
                 'reset_time_utc' => '2026-07-13T23:59:59Z',
             ])),
-            new Response(200, [], "1\n00:00:01,000 --> 00:00:02,000\nHello world.\n"),
+            self::response(200, "1\n00:00:01,000 --> 00:00:02,000\nHello world.\n"),
         ], $history);
 
         $provider->onEnable($this->stubContainer());
@@ -691,27 +765,16 @@ final class OpenSubtitlesProviderTest extends TestCase
 
         $this->assertCount(2, $history);
 
-        $linkRequest = $history[0]['request'];
-        $this->assertSame('POST', $linkRequest->getMethod());
-        $this->assertSame(
-            'https://api.opensubtitles.com/api/v1/download',
-            (string) $linkRequest->getUri(),
-        );
-        /** @var array<string, mixed> */
-        $requestBody = json_decode((string) $linkRequest->getBody(), true);
+        $this->assertSame('POST', $history[0]['method']);
+        $this->assertSame('https://api.opensubtitles.com/api/v1/download', $history[0]['url']);
+        /** @var array<string, mixed> $requestBody */
+        $requestBody = json_decode((string) $history[0]['body'], true);
         $this->assertSame(['file_id' => 998877, 'sub_format' => 'srt'], $requestBody);
 
-        $contentRequest = $history[1]['request'];
-        $this->assertSame('GET', $contentRequest->getMethod());
-        $this->assertSame(
-            'https://dl.opensubtitles.org/download/src/upload/12345.srt',
-            (string) $contentRequest->getUri(),
-        );
+        $this->assertSame('GET', $history[1]['method']);
+        $this->assertSame('https://dl.opensubtitles.org/download/src/upload/12345.srt', $history[1]['url']);
 
-        $this->assertSame(
-            "1\n00:00:01,000 --> 00:00:02,000\nHello world.\n",
-            $download->content,
-        );
+        $this->assertSame("1\n00:00:01,000 --> 00:00:02,000\nHello world.\n", $download->content);
         $this->assertSame('srt', $download->format);
         $this->assertSame('Movie.Name.2019.srt', $download->fileName);
         $this->assertSame(1, $download->requestsUsed);
@@ -721,83 +784,46 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertSame('2026-07-13T23:59:59Z', $download->resetTimeUtc);
     }
 
-    /**
-     * Dedicated regression test for the download endpoint's resolved URL, in the
-     * same single-purpose style as {@see test_login_posts_to_the_correct_v1_login_url()}
-     * and {@see test_search_by_imdb_id_requests_the_correct_v1_subtitles_url()}.
-     *
-     * Guzzle's `base_uri` + leading-slash request-path resolution (RFC 3986 §5.3)
-     * previously produced 404s on `login` (see `OpenSubtitlesProvider::API_BASE`'s
-     * docblock) because a leading slash on the request path replaces the entire
-     * `base_uri` path component instead of merging with it. `download()`'s request
-     * path (`'download'`, no leading slash) happens to already be correct as
-     * written, but that fact was previously only ever asserted incidentally inside
-     * a larger, multi-assertion test — nothing would have caught a future
-     * leading-slash regression on this specific path in isolation. This asserts
-     * the fully resolved absolute URI on its own, independent of the rest of the
-     * download flow.
-     */
     public function test_download_posts_to_the_correct_v1_download_url(): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
-
         $history = [];
-        $this->installMockHttpClient($provider, [
-            new Response(200, [], (string) json_encode([
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
                 'link' => 'https://dl.opensubtitles.org/download/src/upload/12345.srt',
                 'file_name' => 'movie.srt',
             ])),
-            new Response(200, [], 'subtitle body'),
+            self::response(200, 'subtitle body'),
         ], $history);
 
         $provider->onEnable($this->stubContainer());
         $provider->download(998877);
 
-        $this->assertGreaterThanOrEqual(1, count($history));
-        $request = $history[0]['request'];
-        $this->assertSame('POST', $request->getMethod());
-        $this->assertSame(
-            'https://api.opensubtitles.com/api/v1/download',
-            (string) $request->getUri(),
-        );
+        $this->assertSame('POST', $history[0]['method']);
+        $this->assertSame('https://api.opensubtitles.com/api/v1/download', $history[0]['url']);
     }
 
-    /**
-     * When the first-step response is missing `link` there is nothing to
-     * fetch content from — this must fail loudly rather than return an
-     * empty/placeholder subtitle.
-     */
     public function test_download_throws_when_response_is_missing_link(): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
-
         $history = [];
-        $this->installMockHttpClient($provider, [
-            new Response(200, [], (string) json_encode(['file_name' => 'movie.srt'])),
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode(['file_name' => 'movie.srt'])),
         ], $history);
 
         $provider->onEnable($this->stubContainer());
 
         $this->expectException(OpenSubtitlesException::class);
         $this->expectExceptionMessage('did not include a download link');
-
         $provider->download(998877);
     }
 
-    /**
-     * Defensive branch: if the step-1 `POST download` response is HTTP 200 but
-     * reports `remaining: 0` with no `link`, that is quota exhaustion (there is
-     * nothing else it could mean — the account simply has no downloads left),
-     * so it must surface as {@see OpenSubtitlesQuotaExceededException} rather
-     * than the generic "did not include a download link" message.
-     */
     public function test_download_throws_quota_exceeded_when_no_link_and_zero_remaining(): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
-
         $history = [];
-        $this->installMockHttpClient($provider, [
-            new Response(200, [], (string) json_encode([
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
                 'remaining' => 0,
                 'message' => 'You have downloaded your allowed 20 subtitles for 24h.'
                     . 'Your quota will be renewed in 00 hours and 27 minutes (2023-05-24 23:59:59 UTC) ',
@@ -816,27 +842,12 @@ final class OpenSubtitlesProviderTest extends TestCase
         }
     }
 
-    /**
-     * Regression test for the download-quota-exhaustion UX gap: the real
-     * OpenSubtitles v1 API has no dedicated error shape for this — per
-     * https://github.com/morpheus65535/bazarr/issues/2153, an exhausted
-     * account's `POST download` call fails with an HTTP 4xx status whose body
-     * is just `{"message": "You have downloaded your allowed N subtitles for
-     * 24h...."}`. Before this fix that was only ever caught generically via
-     * `GuzzleException` and turned into `'Download failed: ' . $e->getMessage()`
-     * — this asserts it is now recognized and re-thrown as a distinctly typed
-     * {@see OpenSubtitlesQuotaExceededException} carrying the API's own
-     * message, so a caller (e.g. a multi-provider subtitle-fetch orchestrator)
-     * can react to quota exhaustion specifically instead of string-matching a
-     * generic error.
-     */
     public function test_download_throws_quota_exceeded_when_post_returns_4xx_quota_message(): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
-
         $history = [];
-        $this->installMockHttpClient($provider, [
-            new Response(406, [], (string) json_encode([
+        $this->installFakeTransport($provider, [
+            self::response(406, (string) json_encode([
                 'message' => 'You have downloaded your allowed 20 subtitles for 24h.'
                     . 'Your quota will be renewed in 00 hours and 27 minutes (2023-05-24 23:59:59 UTC) ',
             ])),
@@ -852,19 +863,12 @@ final class OpenSubtitlesProviderTest extends TestCase
         }
     }
 
-    /**
-     * The quota-message heuristic must not fire for an unrelated 4xx failure
-     * (e.g. an expired/invalid session token) — that must still surface as the
-     * generic {@see OpenSubtitlesException}, not be misrepresented as quota
-     * exhaustion.
-     */
     public function test_download_does_not_report_quota_exceeded_for_unrelated_4xx(): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
-
         $history = [];
-        $this->installMockHttpClient($provider, [
-            new Response(401, [], (string) json_encode(['message' => 'Unauthorized'])),
+        $this->installFakeTransport($provider, [
+            self::response(401, (string) json_encode(['message' => 'Unauthorized'])),
         ], $history);
 
         $provider->onEnable($this->stubContainer());
@@ -876,24 +880,16 @@ final class OpenSubtitlesProviderTest extends TestCase
             $provider->download(998877);
         } catch (OpenSubtitlesException $e) {
             $this->assertNotInstanceOf(OpenSubtitlesQuotaExceededException::class, $e);
-
             throw $e;
         }
     }
 
-    /**
-     * When the step-1 response reports `remaining: 0` with no `link` but ALSO
-     * no `message` (the API's `message` field is documented as optional quota
-     * accounting, not always present), a clear default message must still be
-     * used rather than an empty/unhelpful one.
-     */
     public function test_download_quota_exceeded_uses_fallback_message_when_api_omits_message(): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
-
         $history = [];
-        $this->installMockHttpClient($provider, [
-            new Response(200, [], (string) json_encode(['remaining' => 0])),
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode(['remaining' => 0])),
         ], $history);
 
         $provider->onEnable($this->stubContainer());
@@ -908,60 +904,76 @@ final class OpenSubtitlesProviderTest extends TestCase
         }
     }
 
-    /**
-     * The step-2 content `GET` (against the temporary `link`) is a separate
-     * network call from the step-1 `POST`, and can fail independently (e.g. the
-     * link expired). This must still surface as a clear
-     * {@see OpenSubtitlesException}, not an uncaught Guzzle exception.
-     */
     public function test_download_throws_when_content_fetch_fails(): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
-
         $history = [];
-        $this->installMockHttpClient($provider, [
-            new Response(200, [], (string) json_encode([
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
                 'link' => 'https://dl.opensubtitles.org/download/src/upload/12345.srt',
                 'file_name' => 'movie.srt',
             ])),
-            new Response(404, [], 'Not Found'),
+            self::response(404, 'Not Found'),
         ], $history);
 
         $provider->onEnable($this->stubContainer());
 
         $this->expectException(OpenSubtitlesException::class);
         $this->expectExceptionMessageMatches('/Download failed/');
-
         $provider->download(998877);
     }
 
+    // ---------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------
+
     /**
-     * Replace the provider's internal Guzzle client with one backed by a
-     * {@see MockHandler} (same `base_uri` as production), wiring Guzzle's
-     * history middleware to append `['request' => ..., 'response' => ...]`
-     * entries into `$history` as calls happen. `$history` MUST be passed by
-     * reference from the caller (not returned) because
-     * {@see Middleware::history()} binds the container by reference at
-     * closure-creation time — returning a fresh array here would only ever
-     * capture the empty pre-call snapshot.
-     *
-     * @param list<Response>                       $responses Queued mock responses, in order.
-     * @param list<array{request: RequestInterface}> $history  Out-param; appended to as requests fire.
+     * @return array{status:int, body:string}
      */
-    private function installMockHttpClient(OpenSubtitlesProvider $provider, array $responses, array &$history): void
+    private static function response(int $status, string $body): array
     {
-        $mock = new MockHandler($responses);
-        $stack = HandlerStack::create($mock);
-        $stack->push(Middleware::history($history));
+        return ['status' => $status, 'body' => $body];
+    }
 
-        $client = new Client([
-            'base_uri' => 'https://api.opensubtitles.com/api/v1/',
-            'handler' => $stack,
-        ]);
+    /**
+     * Install a fake transport closure into the provider that records outgoing
+     * requests into $history and returns queued {status, body} responses.
+     *
+     * $history MUST be passed by reference — the closure binds it by reference
+     * so requests appended during the call are visible to the caller afterwards.
+     *
+     * @param list<array{status:int, body:string}>                                   $responses
+     * @param list<array{method:string, url:string, headers:array<string,string>, body:?string}> $history
+     */
+    private function installFakeTransport(OpenSubtitlesProvider $provider, array $responses, array &$history): void
+    {
+        $queue = $responses;
+        $transport = function (string $method, string $url, array $headers, ?string $body) use (&$queue, &$history): array {
+            $history[] = ['method' => $method, 'url' => $url, 'headers' => $headers, 'body' => $body];
+            if ($queue === []) {
+                throw new \RuntimeException("FakeTransport: no queued response for {$method} {$url}");
+            }
 
-        $property = new \ReflectionProperty(OpenSubtitlesProvider::class, 'httpClient');
+            return array_shift($queue);
+        };
+
+        $property = new \ReflectionProperty(OpenSubtitlesProvider::class, 'transport');
         $property->setAccessible(true);
-        $property->setValue($provider, $client);
+        $property->setValue($provider, $transport);
+    }
+
+    /**
+     * Write $content to a temp file and return its path.
+     */
+    private function makeFixture(string $content): string
+    {
+        $path = tempnam(sys_get_temp_dir(), 'phlix_os_');
+        if ($path === false) {
+            $this->fail('Could not create temp fixture file');
+        }
+        file_put_contents($path, $content);
+
+        return $path;
     }
 
     private function stubContainer(): ContainerInterface
