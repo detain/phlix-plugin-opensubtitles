@@ -33,15 +33,19 @@ class OpenSubtitlesQuotaExceededException extends OpenSubtitlesException
      * @param string      $message      Human-readable quota-exceeded message (the
      *        API's own `message` field when available, e.g. "You have downloaded
      *        your allowed 20 subtitles for 24h.").
-     * @param string|null $resetTime    Human-readable quota reset time (API field
+     * @param string|null $resetTime          Human-readable quota reset time (API field
      *        `reset_time`), if the API reported one.
-     * @param string|null $resetTimeUtc ISO-8601 UTC quota reset timestamp (API
+     * @param string|null $resetTimeUtc       ISO-8601 UTC quota reset timestamp (API
      *        field `reset_time_utc`), if the API reported one.
+     * @param int|null    $downloadsRemaining Downloads remaining in the current quota
+     *        window (API field `remaining`), if the API reported one. Usually 0 when
+     *        the quota is exhausted; null when the provider did not report it.
      */
     public function __construct(
         string $message,
         public readonly ?string $resetTime = null,
         public readonly ?string $resetTimeUtc = null,
+        public readonly ?int $downloadsRemaining = null,
     ) {
         parent::__construct($message);
     }

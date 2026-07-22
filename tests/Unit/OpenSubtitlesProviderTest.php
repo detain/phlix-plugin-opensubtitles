@@ -15,6 +15,10 @@ use Phlix\PluginOpenSubtitles\OpenSubtitlesException;
 use Phlix\PluginOpenSubtitles\OpenSubtitlesProvider;
 use Phlix\PluginOpenSubtitles\OpenSubtitlesQuotaExceededException;
 use Phlix\PluginOpenSubtitles\SubtitleDownload;
+use Phlix\Shared\Subtitle\Exception\QuotaExceeded;
+use Phlix\Shared\Subtitle\SubtitleCandidate;
+use Phlix\Shared\Subtitle\SubtitleFile;
+use Phlix\Shared\Subtitle\SubtitleSourceInterface;
 use PHPUnit\Framework\TestCase;
 use Psr\Container\ContainerInterface;
 
@@ -158,7 +162,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $provider->onEnable($this->stubContainer());
         $this->assertCount(0, $history, 'no request until first use');
 
-        $provider->searchByImdbId('tt1234567');
+        $provider->searchByImdbIdRaw('tt1234567');
 
         $this->assertCount(2, $history);
         $this->assertSame('POST', $history[0]['method']);
@@ -190,8 +194,8 @@ final class OpenSubtitlesProviderTest extends TestCase
         ], $history);
 
         $provider->onEnable($this->stubContainer());
-        $provider->searchByImdbId('tt1');
-        $provider->searchByImdbId('tt2');
+        $provider->searchByImdbIdRaw('tt1');
+        $provider->searchByImdbIdRaw('tt2');
 
         $loginCalls = array_filter($history, static fn (array $h): bool => str_ends_with($h['url'], '/login'));
         $this->assertCount(1, $loginCalls);
@@ -216,7 +220,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         ], $history);
 
         $provider->onEnable($this->stubContainer());
-        $results = $provider->searchByImdbId('tt1234567');
+        $results = $provider->searchByImdbIdRaw('tt1234567');
 
         $this->assertSame([], $results);
         $this->assertFalse($provider->isLoggedIn());
@@ -245,7 +249,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->installFakeTransport($provider, [self::response(200, '{"data":[]}')], $history);
 
         $provider->onEnable($this->stubContainer());
-        $provider->searchByImdbId('tt1234567');
+        $provider->searchByImdbIdRaw('tt1234567');
 
         $this->assertSame(
             'Phlix-Plugin-OpenSubtitles/' . $expectedVersion,
@@ -401,35 +405,35 @@ final class OpenSubtitlesProviderTest extends TestCase
     {
         $this->expectException(OpenSubtitlesException::class);
         $this->expectExceptionMessage('not enabled');
-        (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY))->searchByImdbId('tt1234567');
+        (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY))->searchByImdbIdRaw('tt1234567');
     }
 
     public function test_search_by_filename_throws_before_onenable(): void
     {
         $this->expectException(OpenSubtitlesException::class);
         $this->expectExceptionMessage('not enabled');
-        (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY))->searchByFilename('movie.mkv');
+        (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY))->searchByFilenameRaw('movie.mkv');
     }
 
     public function test_search_by_hash_throws_before_onenable(): void
     {
         $this->expectException(OpenSubtitlesException::class);
         $this->expectExceptionMessage('not enabled');
-        (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY))->searchByHash('abc123', 1234567);
+        (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY))->searchByHashRaw('abc123', 1234567);
     }
 
     public function test_search_by_path_throws_before_onenable(): void
     {
         $this->expectException(OpenSubtitlesException::class);
         $this->expectExceptionMessage('not enabled');
-        (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY))->searchByPath('/some/movie.mkv');
+        (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY))->searchByPathRaw('/some/movie.mkv');
     }
 
     public function test_download_throws_before_onenable(): void
     {
         $this->expectException(OpenSubtitlesException::class);
         $this->expectExceptionMessage('not enabled');
-        (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY))->download(12345);
+        (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY))->downloadRaw(12345);
     }
 
     // ---------------------------------------------------------------------
@@ -443,7 +447,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->installFakeTransport($provider, [self::response(200, '{"data":[]}')], $history);
 
         $provider->onEnable($this->stubContainer());
-        $provider->searchByImdbId('tt1234567');
+        $provider->searchByImdbIdRaw('tt1234567');
 
         $this->assertCount(1, $history);
         $this->assertSame('GET', $history[0]['method']);
@@ -466,7 +470,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->installFakeTransport($provider, [self::response(200, '{"data":[]}')], $history);
 
         $provider->onEnable($this->stubContainer());
-        $provider->searchByHash('8e245d9679d31e12', 12909756);
+        $provider->searchByHashRaw('8e245d9679d31e12', 12909756);
 
         $this->assertCount(1, $history);
         $this->assertStringContainsString('moviehash=8e245d9679d31e12', $history[0]['url']);
@@ -501,7 +505,7 @@ final class OpenSubtitlesProviderTest extends TestCase
 
         try {
             $provider->onEnable($this->stubContainer());
-            $results = $provider->searchByPath($file);
+            $results = $provider->searchByPathRaw($file);
         } finally {
             unlink($file);
         }
@@ -523,7 +527,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->installFakeTransport($provider, [self::response(200, '{"data":[]}')], $history);
 
         $provider->onEnable($this->stubContainer());
-        $provider->searchByPath('/nonexistent/Movie.Name.2019.mkv');
+        $provider->searchByPathRaw('/nonexistent/Movie.Name.2019.mkv');
 
         $this->assertCount(1, $history);
         $this->assertStringNotContainsString('moviehash=', $history[0]['url']);
@@ -554,7 +558,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         ], $history);
 
         $provider->onEnable($this->stubContainer());
-        $results = $provider->searchByImdbId('tt1234567');
+        $results = $provider->searchByImdbIdRaw('tt1234567');
 
         $this->assertCount(1, $results);
         $this->assertSame('3634077', $results[0]['id']);
@@ -589,7 +593,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         ], $history);
 
         $provider->onEnable($this->stubContainer());
-        $results = $provider->searchByImdbId('tt0133093');
+        $results = $provider->searchByImdbIdRaw('tt0133093');
 
         $this->assertSame('tt0133093', $results[0]['imdb_id']);
     }
@@ -623,7 +627,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         ], $history);
 
         $provider->onEnable($this->stubContainer());
-        $results = $provider->searchByImdbId('tt1234567');
+        $results = $provider->searchByImdbIdRaw('tt1234567');
 
         $this->assertCount(2, $results);
         $this->assertNull($results[0]['imdb_id']);
@@ -652,7 +656,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         ], $history);
 
         $provider->onEnable($this->stubContainer());
-        $results = $provider->searchByImdbId('tt1234567');
+        $results = $provider->searchByImdbIdRaw('tt1234567');
 
         $this->assertCount(1, $results);
         $this->assertSame(111111, $results[0]['file_id']);
@@ -679,7 +683,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         ], $history);
 
         $provider->onEnable($this->stubContainer());
-        $results = $provider->searchByImdbId('tt1234567');
+        $results = $provider->searchByImdbIdRaw('tt1234567');
 
         $this->assertCount(2, $results);
         $this->assertSame(['1', '3'], array_column($results, 'id'));
@@ -695,7 +699,7 @@ final class OpenSubtitlesProviderTest extends TestCase
 
         $this->expectException(OpenSubtitlesException::class);
         $this->expectExceptionMessage('Search by IMDB ID failed');
-        $provider->searchByImdbId('tt1234567');
+        $provider->searchByImdbIdRaw('tt1234567');
     }
 
     // ---------------------------------------------------------------------
@@ -728,12 +732,12 @@ final class OpenSubtitlesProviderTest extends TestCase
         ], $history);
 
         $provider->onEnable($this->stubContainer());
-        $results = $provider->searchByImdbId('tt1234567');
+        $results = $provider->searchByImdbIdRaw('tt1234567');
 
         $secondCdFileId = $results[0]['files'][1]['file_id'];
         $this->assertSame(111112, $secondCdFileId);
 
-        $download = $provider->download($secondCdFileId);
+        $download = $provider->downloadRaw($secondCdFileId);
 
         $this->assertCount(3, $history);
         /** @var array<string, mixed> $requestBody */
@@ -761,7 +765,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         ], $history);
 
         $provider->onEnable($this->stubContainer());
-        $download = $provider->download(998877);
+        $download = $provider->downloadRaw(998877);
 
         $this->assertCount(2, $history);
 
@@ -797,7 +801,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         ], $history);
 
         $provider->onEnable($this->stubContainer());
-        $provider->download(998877);
+        $provider->downloadRaw(998877);
 
         $this->assertSame('POST', $history[0]['method']);
         $this->assertSame('https://api.opensubtitles.com/api/v1/download', $history[0]['url']);
@@ -815,7 +819,7 @@ final class OpenSubtitlesProviderTest extends TestCase
 
         $this->expectException(OpenSubtitlesException::class);
         $this->expectExceptionMessage('did not include a download link');
-        $provider->download(998877);
+        $provider->downloadRaw(998877);
     }
 
     public function test_download_throws_quota_exceeded_when_no_link_and_zero_remaining(): void
@@ -834,7 +838,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $provider->onEnable($this->stubContainer());
 
         try {
-            $provider->download(998877);
+            $provider->downloadRaw(998877);
             $this->fail('Expected OpenSubtitlesQuotaExceededException to be thrown.');
         } catch (OpenSubtitlesQuotaExceededException $e) {
             $this->assertStringContainsString('allowed 20 subtitles for 24h', $e->getMessage());
@@ -856,7 +860,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $provider->onEnable($this->stubContainer());
 
         try {
-            $provider->download(998877);
+            $provider->downloadRaw(998877);
             $this->fail('Expected OpenSubtitlesQuotaExceededException to be thrown.');
         } catch (OpenSubtitlesQuotaExceededException $e) {
             $this->assertStringContainsString('allowed 20 subtitles for 24h', $e->getMessage());
@@ -877,7 +881,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->expectExceptionMessageMatches('/Download failed/');
 
         try {
-            $provider->download(998877);
+            $provider->downloadRaw(998877);
         } catch (OpenSubtitlesException $e) {
             $this->assertNotInstanceOf(OpenSubtitlesQuotaExceededException::class, $e);
             throw $e;
@@ -895,7 +899,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $provider->onEnable($this->stubContainer());
 
         try {
-            $provider->download(998877);
+            $provider->downloadRaw(998877);
             $this->fail('Expected OpenSubtitlesQuotaExceededException to be thrown.');
         } catch (OpenSubtitlesQuotaExceededException $e) {
             $this->assertStringContainsString('quota exceeded', $e->getMessage());
@@ -920,12 +924,403 @@ final class OpenSubtitlesProviderTest extends TestCase
 
         $this->expectException(OpenSubtitlesException::class);
         $this->expectExceptionMessageMatches('/Download failed/');
-        $provider->download(998877);
+        $provider->downloadRaw(998877);
+    }
+
+    // ---------------------------------------------------------------------
+    // Shared SubtitleSourceInterface contract (Wave 3 F3)
+    // ---------------------------------------------------------------------
+
+    /**
+     * The entry class the host loads (`plugin.json` `entry`) MUST itself satisfy
+     * `instanceof SubtitleSourceInterface` so the host's subtitle-source registry
+     * detects it on the entry instance (mirroring the metadata plugins).
+     */
+    public function test_entry_class_is_a_subtitle_source(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $this->assertInstanceOf(SubtitleSourceInterface::class, $provider);
+    }
+
+    public function test_get_name_returns_the_stable_source_slug(): void
+    {
+        $this->assertSame('opensubtitles', (new OpenSubtitlesProvider())->getName());
+    }
+
+    public function test_get_priority_returns_default_then_configured_value(): void
+    {
+        $provider = new OpenSubtitlesProvider();
+        $this->assertSame(10, $provider->getPriority());
+
+        $provider->configure(['api_key' => self::TEST_API_KEY, 'priority' => 3]);
+        $this->assertSame(3, $provider->getPriority());
+
+        // Numeric-string settings coerce; blank/garbage fall back to the default.
+        $provider->configure(['api_key' => self::TEST_API_KEY, 'priority' => '7']);
+        $this->assertSame(7, $provider->getPriority());
+        $provider->configure(['api_key' => self::TEST_API_KEY, 'priority' => 'oops']);
+        $this->assertSame(10, $provider->getPriority());
+    }
+
+    public function test_constructor_priority_is_wired(): void
+    {
+        $this->assertSame(2, (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY, priority: 2))->getPriority());
+    }
+
+    /**
+     * searchByImdbId maps the JSON:API response into SubtitleCandidate DTOs with
+     * every ranking field populated and matchedBy == MATCH_IMDB.
+     */
+    public function test_contract_search_by_imdb_id_maps_candidates_with_match_imdb(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'data' => [[
+                    'id' => '3634077',
+                    'attributes' => [
+                        'language' => 'en',
+                        'download_count' => 5000,
+                        'ratings' => 8.5,
+                        'hearing_impaired' => true,
+                        'fps' => 23.976,
+                        'feature_details' => ['imdb_id' => 1234567],
+                        'files' => [['file_id' => 998877, 'cd_number' => 1, 'file_name' => 'Movie.Name.2019.srt']],
+                    ],
+                ]],
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $candidates = $provider->searchByImdbId('tt1234567', ['en']);
+
+        $this->assertCount(1, $candidates);
+        $c = $candidates[0];
+        $this->assertInstanceOf(SubtitleCandidate::class, $c);
+        $this->assertSame('opensubtitles', $c->provider);
+        $this->assertSame('en', $c->language);
+        $this->assertSame('998877', $c->downloadId);
+        $this->assertSame('Movie.Name.2019.srt', $c->releaseName);
+        $this->assertSame('srt', $c->format);
+        $this->assertSame(SubtitleCandidate::MATCH_IMDB, $c->matchedBy);
+        $this->assertSame(8.5, $c->rating);
+        $this->assertSame(5000, $c->downloadCount);
+        $this->assertTrue($c->hearingImpaired);
+        $this->assertSame(23.976, $c->fps);
+        // Request carried the imdb id + language filter, and consumed NO quota
+        // (search never hits the /download endpoint).
+        $this->assertCount(1, $history);
+        $this->assertStringContainsString('imdb_id=tt1234567', $history[0]['url']);
+        $this->assertStringContainsString('languages=en', $history[0]['url']);
+        $this->assertStringNotContainsString('/download', $history[0]['url']);
+    }
+
+    /**
+     * searchByHash stamps MATCH_HASH and sends both moviehash + moviebytesize.
+     */
+    public function test_contract_search_by_hash_maps_candidates_with_match_hash(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'data' => [[
+                    'id' => '1',
+                    'attributes' => [
+                        'language' => 'es',
+                        'download_count' => 42,
+                        'files' => [['file_id' => 555, 'cd_number' => 1, 'file_name' => 'movie.es.ass']],
+                    ],
+                ]],
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $candidates = $provider->searchByHash('8e245d9679d31e12', 12909756, ['es']);
+
+        $this->assertCount(1, $candidates);
+        $this->assertSame(SubtitleCandidate::MATCH_HASH, $candidates[0]->matchedBy);
+        $this->assertSame('555', $candidates[0]->downloadId);
+        $this->assertSame('ass', $candidates[0]->format);
+        $this->assertStringContainsString('moviehash=8e245d9679d31e12', $history[0]['url']);
+        $this->assertStringContainsString('moviebytesize=12909756', $history[0]['url']);
+    }
+
+    /**
+     * searchByPath computes the real moviehash, searches by hash, and stamps
+     * MATCH_HASH on the resulting candidates.
+     */
+    public function test_contract_search_by_path_uses_hash_and_marks_match_hash(): void
+    {
+        $file = $this->makeFixture(str_repeat("\0", 131072));
+        $expectedHash = OpenSubtitlesProvider::computeMovieHash($file);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'data' => [[
+                    'id' => '1',
+                    'attributes' => [
+                        'language' => 'en',
+                        'download_count' => 1,
+                        'files' => [['file_id' => 1, 'cd_number' => 1, 'file_name' => 'a.srt']],
+                    ],
+                ]],
+            ])),
+        ], $history);
+
+        try {
+            $provider->onEnable($this->stubContainer());
+            $candidates = $provider->searchByPath($file, []);
+        } finally {
+            unlink($file);
+        }
+
+        $this->assertCount(1, $candidates);
+        $this->assertSame(SubtitleCandidate::MATCH_HASH, $candidates[0]->matchedBy);
+        $this->assertStringContainsString('moviehash=' . $expectedHash, $history[0]['url']);
+        // Empty language list => no languages filter is sent.
+        $this->assertStringNotContainsString('languages=', $history[0]['url']);
+    }
+
+    /**
+     * When the file cannot be hashed, searchByPath falls back to a filename
+     * query and stamps MATCH_NAME (lowest confidence).
+     */
+    public function test_contract_search_by_path_falls_back_to_name_match(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'data' => [[
+                    'id' => '1',
+                    'attributes' => [
+                        'language' => 'en',
+                        'download_count' => 1,
+                        'files' => [['file_id' => 9, 'cd_number' => 1, 'file_name' => 'b.srt']],
+                    ],
+                ]],
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $candidates = $provider->searchByPath('/nonexistent/Movie.Name.2019.mkv', []);
+
+        $this->assertCount(1, $candidates);
+        $this->assertSame(SubtitleCandidate::MATCH_NAME, $candidates[0]->matchedBy);
+        $this->assertStringNotContainsString('moviehash=', $history[0]['url']);
+        $this->assertStringContainsString('query=', $history[0]['url']);
+    }
+
+    /**
+     * download() takes a candidate, uses its downloadId as the OpenSubtitles
+     * file_id, runs the two-step fetch, and returns a decoded SubtitleFile.
+     */
+    public function test_contract_download_returns_subtitle_file_with_decoded_content(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY, format: 'srt');
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'link' => 'https://dl.opensubtitles.org/download/src/upload/998877.srt',
+                'file_name' => 'The.Matrix.1999.en.srt',
+                'remaining' => 19,
+            ])),
+            self::response(200, "1\n00:00:01,000 --> 00:00:02,000\nHello.\n"),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $file = $provider->download(self::candidate('998877', 'en', 'srt', 'The.Matrix.1999.1080p'));
+
+        $this->assertInstanceOf(SubtitleFile::class, $file);
+        $this->assertSame('en', $file->language);
+        $this->assertSame('srt', $file->format);
+        $this->assertSame("1\n00:00:01,000 --> 00:00:02,000\nHello.\n", $file->content);
+        $this->assertSame('opensubtitles', $file->provider);
+        $this->assertSame('The.Matrix.1999.en.srt', $file->suggestedFilename);
+        $this->assertSame('UTF-8', $file->encoding);
+        $this->assertSame('The.Matrix.1999.1080p', $file->releaseName);
+
+        // Round-trips the candidate's downloadId into the /download file_id body.
+        $this->assertSame('https://api.opensubtitles.com/api/v1/download', $history[0]['url']);
+        /** @var array<string, mixed> $body */
+        $body = json_decode((string) $history[0]['body'], true);
+        $this->assertSame(998877, $body['file_id']);
+    }
+
+    /**
+     * suggestedFilename must be a safe BASE name — even if the provider returns a
+     * name with directory components, download() strips them (path-traversal
+     * hardening for the host writing into /var/subtitles).
+     */
+    public function test_contract_download_sanitizes_suggested_filename_to_base_name(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY, format: 'srt');
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'link' => 'https://dl.opensubtitles.org/x.srt',
+                'file_name' => '../../etc/evil.srt',
+            ])),
+            self::response(200, 'body'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $file = $provider->download(self::candidate('42', 'en', 'srt', 'rel'));
+
+        $this->assertSame('evil.srt', $file->suggestedFilename);
+        $this->assertStringNotContainsString('/', $file->suggestedFilename);
+    }
+
+    /**
+     * A search must NEVER consume or trip quota: even if the provider WOULD
+     * report a quota problem on /download, the search path never calls it, so no
+     * QuotaExceeded is thrown.
+     */
+    public function test_contract_search_does_not_consume_quota(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [self::response(200, '{"data":[]}')], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $candidates = $provider->searchByImdbId('tt1234567', []);
+
+        $this->assertSame([], $candidates);
+        $this->assertCount(1, $history);
+        $this->assertStringNotContainsString('/download', $history[0]['url']);
+    }
+
+    /**
+     * download() translates the provider's quota exhaustion (a 200 with
+     * remaining:0 and no link) into the SHARED QuotaExceeded, carrying the
+     * remaining allowance and reset time so the host can persist quota state.
+     */
+    public function test_contract_download_throws_shared_quota_exceeded_with_context(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'remaining' => 0,
+                'message' => 'You have downloaded your allowed 20 subtitles for 24h.',
+                'reset_time_utc' => '2026-07-13T23:59:59Z',
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->download(self::candidate('998877', 'en', 'srt', 'rel'));
+            $this->fail('Expected shared QuotaExceeded to be thrown.');
+        } catch (QuotaExceeded $e) {
+            $this->assertStringContainsString('allowed 20 subtitles for 24h', $e->getMessage());
+            $this->assertSame(0, $e->getDownloadsRemaining());
+            $this->assertSame('2026-07-13T23:59:59Z', $e->getResetTimeUtc());
+        }
+    }
+
+    /**
+     * The 406 quota-message path also maps to the shared QuotaExceeded.
+     */
+    public function test_contract_download_maps_4xx_quota_to_shared_quota_exceeded(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(406, (string) json_encode([
+                'message' => 'You have downloaded your allowed 20 subtitles for 24h.',
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->expectException(QuotaExceeded::class);
+        $provider->download(self::candidate('998877', 'en', 'srt', 'rel'));
+    }
+
+    /**
+     * A non-quota download failure surfaces the generic OpenSubtitlesException,
+     * NOT the shared QuotaExceeded (a caller distinguishes quota from other
+     * failures).
+     */
+    public function test_contract_download_non_quota_failure_is_not_quota_exceeded(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(401, (string) json_encode(['message' => 'Unauthorized'])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->download(self::candidate('998877', 'en', 'srt', 'rel'));
+            $this->fail('Expected OpenSubtitlesException.');
+        } catch (OpenSubtitlesException $e) {
+            $this->assertNotInstanceOf(QuotaExceeded::class, $e);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Contract not-enabled guards
+    // ---------------------------------------------------------------------
+
+    public function test_contract_search_by_imdb_id_throws_before_onenable(): void
+    {
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessage('not enabled');
+        (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY))->searchByImdbId('tt1234567', []);
+    }
+
+    public function test_contract_search_by_hash_throws_before_onenable(): void
+    {
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessage('not enabled');
+        (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY))->searchByHash('abc123', 1234567, []);
+    }
+
+    public function test_contract_search_by_path_throws_before_onenable(): void
+    {
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessage('not enabled');
+        (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY))->searchByPath('/some/movie.mkv', []);
+    }
+
+    public function test_contract_download_throws_before_onenable(): void
+    {
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessage('not enabled');
+        (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY))
+            ->download(self::candidate('12345', 'en', 'srt', 'rel'));
     }
 
     // ---------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------
+
+    /**
+     * Build a SubtitleCandidate for download() tests.
+     */
+    private static function candidate(
+        string $downloadId,
+        string $language,
+        string $format,
+        string $releaseName,
+    ): SubtitleCandidate {
+        return new SubtitleCandidate(
+            provider: 'opensubtitles',
+            language: $language,
+            downloadId: $downloadId,
+            releaseName: $releaseName,
+            format: $format,
+            matchedBy: SubtitleCandidate::MATCH_HASH,
+        );
+    }
 
     /**
      * @return array{status:int, body:string}

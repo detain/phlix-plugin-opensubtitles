@@ -14,6 +14,10 @@ namespace Phlix\PluginOpenSubtitles;
 use Phlix\Shared\Plugin\ConfigurableInterface;
 use Phlix\Shared\Plugin\LifecycleInterface;
 use Phlix\Shared\Plugin\Manifest;
+use Phlix\Shared\Subtitle\Exception\QuotaExceeded;
+use Phlix\Shared\Subtitle\SubtitleCandidate;
+use Phlix\Shared\Subtitle\SubtitleFile;
+use Phlix\Shared\Subtitle\SubtitleSourceInterface;
 use Psr\Container\ContainerInterface;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
@@ -60,11 +64,38 @@ use Workerman\Http\Response;
  * by the host's subtitle pipeline (Wave 3 `SubtitleSourceInterface`) rather
  * than via PSR-14 events.
  *
+ * ## Shared subtitle-source contract (Wave 3 F3)
+ *
+ * This entry class implements {@see SubtitleSourceInterface} (phlix-shared
+ * v0.42.0) directly, so the host's subtitle-source registry detects it on the
+ * entry instance (mirroring how metadata plugins carry
+ * {@see \Phlix\Shared\Metadata\MetadataSourceInterface}) and can register /
+ * deregister it on plugin enable/disable. The contract methods ({@see getName()},
+ * {@see getPriority()}, {@see searchByPath()}, {@see searchByHash()},
+ * {@see searchByImdbId()}, {@see download()}) are the host-facing façade; they
+ * delegate to the low-level `*Raw` wire methods and map the OpenSubtitles v1
+ * JSON:API responses into shared {@see SubtitleCandidate} / {@see SubtitleFile}
+ * value objects, translating {@see OpenSubtitlesQuotaExceededException} into the
+ * shared {@see QuotaExceeded}.
+ *
  * @package Phlix\PluginOpenSubtitles
  * @since 0.1.0
  */
-final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInterface
+final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInterface, SubtitleSourceInterface
 {
+    /**
+     * Canonical, stable source name — the identity the host keys this source on
+     * and the value carried in every {@see SubtitleCandidate::$provider}. It must
+     * match the name used in the host `subtitles.provider_priority` ordering.
+     */
+    private const SOURCE_NAME = 'opensubtitles';
+
+    /**
+     * Default ranking weight when the admin has not configured one. Lower runs
+     * first (0 = highest priority), mirroring middleware-style weights.
+     */
+    private const DEFAULT_PRIORITY = 10;
+
     /**
      * OpenSubtitles API base URL. Keeps a trailing slash; request paths are
      * appended without a leading slash so the `/api/v1` prefix is preserved.
@@ -118,6 +149,11 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     private string $format;
 
     /**
+     * Ranking priority of this source relative to its peers (lower runs first).
+     */
+    private int $priority;
+
+    /**
      * Shared non-blocking HTTP client, created lazily on first real request.
      */
     private ?Client $httpClient = null;
@@ -164,6 +200,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * @param string|null $password  OpenSubtitles password (optional).
      * @param string      $language  Default language code (ISO 639-1).
      * @param string      $format    Preferred subtitle format.
+     * @param int         $priority  Ranking weight; lower runs first (0 = highest).
      * @param (\Closure(string, string, array<string,string>, ?string): array{status:int, body:string})|null $transport
      *        Test seam replacing the network call; null in production.
      */
@@ -173,6 +210,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         ?string $password = null,
         string $language = self::DEFAULT_LANGUAGE,
         string $format = self::DEFAULT_FORMAT,
+        int $priority = self::DEFAULT_PRIORITY,
         ?\Closure $transport = null,
     ) {
         // The constructor MUST stay autowirable — the host loader builds the
@@ -184,6 +222,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $this->password = $password;
         $this->language = $language;
         $this->format = $format;
+        $this->priority = $priority;
         $this->transport = $transport;
         $this->logger = new NullLogger();
     }
@@ -212,6 +251,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $this->format = is_string($settings['format'] ?? null) && $settings['format'] !== ''
             ? $settings['format']
             : self::DEFAULT_FORMAT;
+        $this->priority = self::coercePriority($settings['priority'] ?? null);
 
         // Credentials may have changed — allow a fresh deferred login on next use.
         $this->sessionToken = null;
@@ -388,8 +428,197 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         }
     }
 
+    // ---------------------------------------------------------------------
+    // Shared SubtitleSourceInterface façade (Wave 3 F3)
+    // ---------------------------------------------------------------------
+
     /**
-     * Search for subtitles matching the given IMDB ID.
+     * The canonical, stable source name of this subtitle source.
+     *
+     * @return non-empty-string Always {@see SOURCE_NAME} (`opensubtitles`).
+     *
+     * @since 0.5.0
+     */
+    public function getName(): string
+    {
+        return self::SOURCE_NAME;
+    }
+
+    /**
+     * The default ranking priority of this source (lower runs first).
+     *
+     * @return int Configured priority, or {@see DEFAULT_PRIORITY}.
+     *
+     * @since 0.5.0
+     */
+    public function getPriority(): int
+    {
+        return $this->priority;
+    }
+
+    /**
+     * Contract search by local media file path — computes the OSDb moviehash and
+     * searches by hash+size (MATCH_HASH), falling back to a filename heuristic
+     * (MATCH_NAME) when the file cannot be hashed or the hash matched nothing.
+     *
+     * Does NOT consume download quota.
+     *
+     * @param string       $path      Absolute path to the local media file.
+     * @param list<string> $languages ISO 639 codes to filter (empty = no filter).
+     *
+     * @return list<SubtitleCandidate> Candidates, best-match first.
+     *
+     * @throws OpenSubtitlesException When the search transport/HTTP fails.
+     *
+     * @since 0.5.0
+     */
+    public function searchByPath(string $path, array $languages): array
+    {
+        $this->ensureEnabled();
+        $this->ensureConnected();
+
+        $languageCsv = self::languageFilter($languages);
+
+        $hash = self::computeMovieHash($path);
+        $size = is_file($path) ? filesize($path) : false;
+
+        if ($hash !== '' && $size !== false && $size > 0) {
+            $raw = $this->searchSubtitles(
+                self::withLanguages(['moviehash' => $hash, 'moviebytesize' => (string) $size], $languageCsv),
+                $this->format,
+                'hash',
+            );
+
+            if ($raw !== []) {
+                return $this->mapCandidates($raw, SubtitleCandidate::MATCH_HASH);
+            }
+        }
+
+        // Fallback: no usable hash, or the hash matched nothing.
+        $raw = $this->searchSubtitles(
+            $this->filenameQueryParams(basename($path), $languageCsv),
+            $this->format,
+            'filename',
+        );
+
+        return $this->mapCandidates($raw, SubtitleCandidate::MATCH_NAME);
+    }
+
+    /**
+     * Contract hash search by an OSDb movie hash + byte size (MATCH_HASH).
+     *
+     * Does NOT consume download quota.
+     *
+     * @param string       $movieHash OSDb movie hash (16 hex chars).
+     * @param int          $byteSize  Exact byte size the hash was computed from.
+     * @param list<string> $languages ISO 639 codes to filter (empty = no filter).
+     *
+     * @return list<SubtitleCandidate> Candidates, best-match first.
+     *
+     * @throws OpenSubtitlesException When the search transport/HTTP fails.
+     *
+     * @since 0.5.0
+     */
+    public function searchByHash(string $movieHash, int $byteSize, array $languages): array
+    {
+        $this->ensureEnabled();
+        $this->ensureConnected();
+
+        $raw = $this->searchSubtitles(
+            self::withLanguages(
+                ['moviehash' => $movieHash, 'moviebytesize' => (string) $byteSize],
+                self::languageFilter($languages),
+            ),
+            $this->format,
+            'hash',
+        );
+
+        return $this->mapCandidates($raw, SubtitleCandidate::MATCH_HASH);
+    }
+
+    /**
+     * Contract search by IMDb id (MATCH_IMDB). Does NOT consume download quota.
+     *
+     * @param string       $imdbId    IMDb id, with or without the `tt` prefix.
+     * @param list<string> $languages ISO 639 codes to filter (empty = no filter).
+     *
+     * @return list<SubtitleCandidate> Candidates, best-match first.
+     *
+     * @throws OpenSubtitlesException When the search transport/HTTP fails.
+     *
+     * @since 0.5.0
+     */
+    public function searchByImdbId(string $imdbId, array $languages): array
+    {
+        $this->ensureEnabled();
+        $this->ensureConnected();
+
+        $raw = $this->searchSubtitles(
+            self::withLanguages(['imdb_id' => $imdbId], self::languageFilter($languages)),
+            $this->format,
+            'IMDB ID',
+        );
+
+        return $this->mapCandidates($raw, SubtitleCandidate::MATCH_IMDB);
+    }
+
+    /**
+     * Contract on-demand download of ONE chosen candidate's subtitle file.
+     *
+     * Uses {@see SubtitleCandidate::$downloadId} (the OpenSubtitles `file_id`) to
+     * run the two-step download and returns a shared {@see SubtitleFile}. THIS is
+     * the quota-consuming step: a provider quota exhaustion is surfaced as the
+     * shared {@see QuotaExceeded}, carrying the remaining allowance and reset
+     * time when OpenSubtitles reports them.
+     *
+     * @param SubtitleCandidate $candidate The chosen candidate to download.
+     *
+     * @return SubtitleFile The downloaded subtitle, ready to persist and attach.
+     *
+     * @throws QuotaExceeded           When the download quota is exhausted.
+     * @throws OpenSubtitlesException  When the download otherwise fails.
+     *
+     * @since 0.5.0
+     */
+    public function download(SubtitleCandidate $candidate): SubtitleFile
+    {
+        $this->ensureEnabled();
+
+        try {
+            $raw = $this->downloadRaw((int) $candidate->downloadId);
+        } catch (OpenSubtitlesQuotaExceededException $e) {
+            throw new QuotaExceeded(
+                $e->getMessage(),
+                downloadsRemaining: $e->downloadsRemaining,
+                resetTimeUtc: $e->resetTimeUtc,
+                previous: $e,
+            );
+        }
+
+        // $candidate->language / ->format are contract non-empty-strings; the raw
+        // download reports its own resolved format, preferred when present.
+        $format = $raw->format !== '' ? $raw->format : $candidate->format;
+        $language = $candidate->language;
+        $releaseName = $candidate->releaseName !== '' ? $candidate->releaseName : null;
+
+        return new SubtitleFile(
+            language: $language,
+            format: $format,
+            content: $raw->content,
+            provider: self::SOURCE_NAME,
+            suggestedFilename: self::safeFilename($raw->fileName, $releaseName, $language, $format),
+            encoding: 'UTF-8',
+            releaseName: $releaseName,
+            hearingImpaired: $candidate->hearingImpaired,
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Low-level wire API (`*Raw`) — returns provider-shaped arrays / DTOs
+    // ---------------------------------------------------------------------
+
+    /**
+     * Low-level search for subtitles matching the given IMDB ID.
      *
      * @param string $imdbId         IMDB ID (e.g., "tt1234567").
      * @param string $language       Language code (ISO 639-1).
@@ -403,6 +632,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *     filename: string,
      *     imdb_id: ?string,
      *     file_id: int,
+     *     rating: ?float,
+     *     hearing_impaired: bool,
+     *     fps: ?float,
      *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
      * }>
      *
@@ -410,7 +642,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *
      * @since 0.1.0
      */
-    public function searchByImdbId(string $imdbId, string $language = '', string $subtitleFormat = ''): array
+    public function searchByImdbIdRaw(string $imdbId, string $language = '', string $subtitleFormat = ''): array
     {
         $language = $language ?: $this->language;
         $subtitleFormat = $subtitleFormat ?: $this->format;
@@ -425,7 +657,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     }
 
     /**
-     * Search for subtitles for a media file on disk — the preferred entry point.
+     * Low-level search for subtitles for a media file on disk.
      *
      * Computes the OpenSubtitles `moviehash` from the file (see
      * {@see computeMovieHash()}) and searches by hash + filesize, which yields
@@ -447,6 +679,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *     filename: string,
      *     imdb_id: ?string,
      *     file_id: int,
+     *     rating: ?float,
+     *     hearing_impaired: bool,
+     *     fps: ?float,
      *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
      * }>
      *
@@ -454,7 +689,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *
      * @since 0.4.0
      */
-    public function searchByPath(string $filePath, string $language = '', string $subtitleFormat = ''): array
+    public function searchByPathRaw(string $filePath, string $language = '', string $subtitleFormat = ''): array
     {
         $this->ensureEnabled();
 
@@ -462,18 +697,18 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $size = is_file($filePath) ? filesize($filePath) : false;
 
         if ($hash !== '' && $size !== false && $size > 0) {
-            $results = $this->searchByHash($hash, $size, $language, $subtitleFormat);
+            $results = $this->searchByHashRaw($hash, $size, $language, $subtitleFormat);
             if ($results !== []) {
                 return $results;
             }
         }
 
         // Fallback: no usable hash, or the hash matched nothing.
-        return $this->searchByFilename(basename($filePath), $language, $subtitleFormat);
+        return $this->searchByFilenameRaw(basename($filePath), $language, $subtitleFormat);
     }
 
     /**
-     * Search for subtitles matching the given filename (fallback path).
+     * Low-level search for subtitles matching the given filename (fallback path).
      *
      * @param string $filename       Media filename.
      * @param string $language       Language code (ISO 639-1).
@@ -487,6 +722,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *     filename: string,
      *     imdb_id: ?string,
      *     file_id: int,
+     *     rating: ?float,
+     *     hearing_impaired: bool,
+     *     fps: ?float,
      *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
      * }>
      *
@@ -494,7 +732,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *
      * @since 0.1.0
      */
-    public function searchByFilename(string $filename, string $language = '', string $subtitleFormat = ''): array
+    public function searchByFilenameRaw(string $filename, string $language = '', string $subtitleFormat = ''): array
     {
         $language = $language ?: $this->language;
         $subtitleFormat = $subtitleFormat ?: $this->format;
@@ -502,19 +740,40 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $this->ensureEnabled();
         $this->ensureConnected();
 
+        return $this->searchSubtitles(
+            $this->filenameQueryParams($filename, $language),
+            $subtitleFormat,
+            'filename',
+        );
+    }
+
+    /**
+     * Build the `/subtitles` query params for a filename-based search.
+     *
+     * A bare filename query is the weakest signal, but useful when we have
+     * neither an IMDB id nor an on-disk file to hash. When a `tt…` id is present
+     * in the filename it is added for a stronger match.
+     *
+     * @param string      $filename    Media filename.
+     * @param string|null $languageCsv Comma-separated language filter, or null for none.
+     *
+     * @return array<string, string>
+     *
+     * @since 0.5.0
+     */
+    private function filenameQueryParams(string $filename, ?string $languageCsv): array
+    {
         $mediaInfo = $this->parseFilename($filename);
 
-        $queryParams = ['languages' => $language];
+        $queryParams = self::withLanguages([], $languageCsv);
 
         if ($mediaInfo['imdb_id'] !== null) {
             $queryParams['imdb_id'] = $mediaInfo['imdb_id'];
         }
 
-        // A bare filename query is the weakest signal, but useful when we have
-        // neither an IMDB id nor an on-disk file to hash.
         $queryParams['query'] = pathinfo($filename, PATHINFO_FILENAME);
 
-        return $this->searchSubtitles($queryParams, $subtitleFormat, 'filename');
+        return $queryParams;
     }
 
     /**
@@ -537,6 +796,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *     filename: string,
      *     imdb_id: ?string,
      *     file_id: int,
+     *     rating: ?float,
+     *     hearing_impaired: bool,
+     *     fps: ?float,
      *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
      * }>
      *
@@ -544,7 +806,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *
      * @since 0.1.0
      */
-    public function searchByHash(string $hash, int $size, string $language = '', string $subtitleFormat = ''): array
+    public function searchByHashRaw(string $hash, int $size, string $language = '', string $subtitleFormat = ''): array
     {
         $language = $language ?: $this->language;
         $subtitleFormat = $subtitleFormat ?: $this->format;
@@ -575,6 +837,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *     filename: string,
      *     imdb_id: ?string,
      *     file_id: int,
+     *     rating: ?float,
+     *     hearing_impaired: bool,
+     *     fps: ?float,
      *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
      * }>
      *
@@ -632,7 +897,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *
      * @since 0.1.0
      */
-    public function download(int $fileId): SubtitleDownload
+    public function downloadRaw(int $fileId): SubtitleDownload
     {
         $this->ensureEnabled();
         $this->ensureConnected();
@@ -731,6 +996,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
                 $message,
                 resetTime: is_string($data['reset_time'] ?? null) ? $data['reset_time'] : null,
                 resetTimeUtc: is_string($data['reset_time_utc'] ?? null) ? $data['reset_time_utc'] : null,
+                downloadsRemaining: is_int($data['remaining'] ?? null) ? $data['remaining'] : null,
             );
         }
 
@@ -760,6 +1026,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             $message,
             resetTime: is_string($data['reset_time'] ?? null) ? $data['reset_time'] : null,
             resetTimeUtc: is_string($data['reset_time_utc'] ?? null) ? $data['reset_time_utc'] : null,
+            downloadsRemaining: is_int($data['remaining'] ?? null) ? $data['remaining'] : null,
         );
     }
 
@@ -953,6 +1220,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *     filename: string,
      *     imdb_id: ?string,
      *     file_id: int,
+     *     rating: ?float,
+     *     hearing_impaired: bool,
+     *     fps: ?float,
      *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
      * }>
      *
@@ -996,6 +1266,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             $languageCode = is_string($attributes['language'] ?? null) ? $attributes['language'] : 'en';
             $downloadCount = is_int($attributes['download_count'] ?? null) ? $attributes['download_count'] : 0;
             $imdbId = self::normalizeImdbId($featureDetails['imdb_id'] ?? null);
+            $rating = self::floatOrNull($attributes['ratings'] ?? null);
+            $hearingImpaired = self::truthy($attributes['hearing_impaired'] ?? null);
+            $fps = self::floatOrNull($attributes['fps'] ?? null);
 
             $idRaw = $subtitle['id'] ?? null;
             $subtitleId = match (true) {
@@ -1012,6 +1285,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
                 'filename' => $filename,
                 'imdb_id' => $imdbId,
                 'file_id' => $primaryFile['file_id'],
+                'rating' => $rating,
+                'hearing_impaired' => $hearingImpaired,
+                'fps' => $fps,
                 'files' => $files,
             ];
         }
@@ -1141,6 +1417,182 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         }
 
         return sprintf('%08x%08x', $high, $low);
+    }
+
+    /**
+     * Map low-level `*Raw` search results into shared {@see SubtitleCandidate}
+     * value objects, stamping how each was matched.
+     *
+     * @param list<array{
+     *     id: string, language: string, format: string, downloads: int,
+     *     filename: string, imdb_id: ?string, file_id: int, rating: ?float,
+     *     hearing_impaired: bool, fps: ?float,
+     *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
+     * }> $raw
+     * @param SubtitleCandidate::MATCH_* $matchedBy How the candidates were matched.
+     *
+     * @return list<SubtitleCandidate>
+     *
+     * @since 0.5.0
+     */
+    private function mapCandidates(array $raw, string $matchedBy): array
+    {
+        $candidates = [];
+
+        foreach ($raw as $row) {
+            if ($row['file_id'] <= 0) {
+                // No usable download token — a candidate we could never fetch.
+                continue;
+            }
+
+            $downloadId = (string) $row['file_id'];
+
+            $language = $row['language'] !== '' ? $row['language'] : self::DEFAULT_LANGUAGE;
+            $format = $row['format'] !== '' ? $row['format'] : self::DEFAULT_FORMAT;
+
+            $candidates[] = new SubtitleCandidate(
+                provider: self::SOURCE_NAME,
+                language: $language,
+                downloadId: $downloadId,
+                releaseName: $row['filename'],
+                format: $format,
+                matchedBy: $matchedBy,
+                rating: $row['rating'],
+                downloadCount: $row['downloads'],
+                hearingImpaired: $row['hearing_impaired'],
+                fps: $row['fps'],
+            );
+        }
+
+        return $candidates;
+    }
+
+    /**
+     * Reduce a language list to the OpenSubtitles comma-separated `languages`
+     * filter value, or null when no filter should be applied (empty list).
+     *
+     * @param list<string> $languages ISO 639 codes.
+     *
+     * @return string|null
+     *
+     * @since 0.5.0
+     */
+    private static function languageFilter(array $languages): ?string
+    {
+        $clean = array_values(array_filter(
+            array_map(static fn (string $l): string => trim($l), $languages),
+            static fn (string $l): bool => $l !== '',
+        ));
+
+        return $clean === [] ? null : implode(',', $clean);
+    }
+
+    /**
+     * Attach the `languages` query param when a non-null filter is present.
+     *
+     * @param array<string, string> $params      Base query params.
+     * @param string|null           $languageCsv Comma-separated filter, or null.
+     *
+     * @return array<string, string>
+     *
+     * @since 0.5.0
+     */
+    private static function withLanguages(array $params, ?string $languageCsv): array
+    {
+        if ($languageCsv !== null) {
+            $params['languages'] = $languageCsv;
+        }
+
+        return $params;
+    }
+
+    /**
+     * Derive a safe base filename (no directory component) for a downloaded
+     * subtitle, ensuring it carries the subtitle format extension.
+     *
+     * @param string      $providerName Provider-reported file name (may be empty).
+     * @param string|null $releaseName  Candidate release name fallback.
+     * @param string      $language     Subtitle language code.
+     * @param string      $format       Subtitle format extension (no dot).
+     *
+     * @return non-empty-string
+     *
+     * @since 0.5.0
+     */
+    private static function safeFilename(
+        string $providerName,
+        ?string $releaseName,
+        string $language,
+        string $format,
+    ): string {
+        // Base name only — strip any directory components and control chars.
+        $base = basename(trim($providerName));
+        $base = (string) preg_replace('#[\x00-\x1F/\\\\]+#', '', $base);
+
+        if ($base === '' || $base === '.') {
+            $stem = pathinfo((string) $releaseName, PATHINFO_FILENAME);
+            if ($stem === '') {
+                $stem = 'subtitle' . ($language !== '' ? '.' . $language : '');
+            }
+            $base = $stem . '.' . ($format !== '' ? $format : self::DEFAULT_FORMAT);
+        }
+
+        return $base;
+    }
+
+    /**
+     * Coerce a raw `priority` setting value to an int, or the default.
+     *
+     * @param mixed $value Raw setting value.
+     *
+     * @return int
+     *
+     * @since 0.5.0
+     */
+    private static function coercePriority(mixed $value): int
+    {
+        return match (true) {
+            is_int($value) => $value,
+            is_string($value) && $value !== '' && preg_match('/^-?\d+$/', $value) === 1 => (int) $value,
+            default => self::DEFAULT_PRIORITY,
+        };
+    }
+
+    /**
+     * Coerce a raw API value to a float, or null when absent/non-numeric.
+     *
+     * @param mixed $value Raw value.
+     *
+     * @return float|null
+     *
+     * @since 0.5.0
+     */
+    private static function floatOrNull(mixed $value): ?float
+    {
+        return match (true) {
+            is_int($value) || is_float($value) => (float) $value,
+            is_string($value) && is_numeric($value) => (float) $value,
+            default => null,
+        };
+    }
+
+    /**
+     * Coerce a raw API value to a bool (accepts the API's 1/0 and "1"/"0").
+     *
+     * @param mixed $value Raw value.
+     *
+     * @return bool
+     *
+     * @since 0.5.0
+     */
+    private static function truthy(mixed $value): bool
+    {
+        return match (true) {
+            is_bool($value) => $value,
+            is_int($value) => $value === 1,
+            is_string($value) => $value === '1' || strtolower($value) === 'true',
+            default => false,
+        };
     }
 
     /**

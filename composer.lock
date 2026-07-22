@@ -4,20 +4,20 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "64dffa479759a8865e7445b700b3b354",
+    "content-hash": "5f5a01c0976397e34d9306534aaaad49",
     "packages": [
         {
             "name": "detain/phlix-shared",
-            "version": "0.21.0",
+            "version": "v0.42.0",
             "source": {
                 "type": "git",
                 "url": "https://github.com/detain/phlix-shared.git",
-                "reference": "129946521f64182d5337f56f5617e05ba8d3bcde"
+                "reference": "935741d3616dbe4ab3018a2bbf1e58d0465ba2f3"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/detain/phlix-shared/zipball/129946521f64182d5337f56f5617e05ba8d3bcde",
-                "reference": "129946521f64182d5337f56f5617e05ba8d3bcde",
+                "url": "https://api.github.com/repos/detain/phlix-shared/zipball/935741d3616dbe4ab3018a2bbf1e58d0465ba2f3",
+                "reference": "935741d3616dbe4ab3018a2bbf1e58d0465ba2f3",
                 "shasum": ""
             },
             "require": {
@@ -68,10 +68,10 @@
             ],
             "description": "Shared interfaces, DTOs, event names, and protocol types used by both phlix-server and phlix-hub. Composer-installable, PHP 8.3+, zero I/O by charter — the only bundled network code is the blocking CurlArrTransport (CLI/test only); event-loop consumers MUST inject an async ArrTransportInterface.",
             "support": {
-                "source": "https://github.com/detain/phlix-shared/tree/v0.21.0",
+                "source": "https://github.com/detain/phlix-shared/tree/v0.42.0",
                 "issues": "https://github.com/detain/phlix-shared/issues"
             },
-            "time": "2026-07-20T16:32:01+00:00"
+            "time": "2026-07-22T03:47:52+00:00"
         },
         {
             "name": "psr/clock",

@@ -1,6 +1,6 @@
 {
     "name": "phlix-plugin-opensubtitles",
-    "version": "0.4.0",
+    "version": "0.5.0",
     "phlix_min_server_version": "1.2.0",
     "type": "subtitle-provider",
     "entry": "Phlix\\PluginOpenSubtitles\\OpenSubtitlesProvider",
@@ -44,6 +44,13 @@
             "default": "srt",
             "label": "Subtitle format",
             "description": "Preferred subtitle format (srt, sub, ass, etc.). Optional; default srt."
+        },
+        "priority": {
+            "type": "integer",
+            "required": false,
+            "default": 10,
+            "label": "Source priority",
+            "description": "Ranking weight for this subtitle source relative to others. Lower runs first (0 = highest priority). Admins can still override the effective order via the server subtitle-provider priority list."
         }
     },
     "signature": null
