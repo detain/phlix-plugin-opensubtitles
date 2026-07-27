@@ -11,7 +11,7 @@ This plugin integrates [OpenSubtitles](https://www.opensubtitles.com/) into the 
 
 - **IMDB ID** — find subtitles for a specific movie/TV show
 - **Filename** — extract media info from a filename and search matching subtitles
-- **File hash** — match subtitles using the OpenSubtitles hash algorithm
+- **File hash** — match subtitles using the OpenSubtitles `moviehash` algorithm
 
 ## Install
 
@@ -38,6 +38,7 @@ Configure these in the Phlix admin **Plugins → Configure** dialog.
 | `password`   | No       | yes    | —       | OpenSubtitles.com password. Only used with the username. |
 | `language`   | No       | —      | `en`    | Default subtitle language (ISO 639-1, e.g. en, es, fr). |
 | `format`     | No       | —      | `srt`   | Preferred subtitle format (srt, sub, ass, etc.). |
+| `priority`   | No       | —      | `10`    | Ranking weight for this subtitle source relative to others. Lower runs first (0 = highest priority); admins can override the effective order via the server subtitle-provider priority list. |
 
 ### Where to get your API key
 
@@ -47,11 +48,13 @@ account `username`/`password` as well is optional but raises your download quota
 
 ## How it works
 
-The plugin implements the `Phlix\Shared\Plugin\LifecycleInterface` contract and connects to the OpenSubtitles REST API v1:
+The plugin implements the `Phlix\Shared\Plugin\LifecycleInterface`, `Phlix\Shared\Plugin\ConfigurableInterface`, and `Phlix\Shared\Subtitle\SubtitleSourceInterface` contracts and connects to the OpenSubtitles REST API v1:
 
 1. **Login** — registers a user agent and obtains a session token
-2. **Search** — queries subtitles by IMDB ID, filename, or hash
+2. **Search** — queries subtitles by IMDB ID, filename, or `moviehash`
 3. **Download** — fetches the subtitle file and feeds it into Phlix's subtitle pipeline
+
+When the account's download quota is exhausted, `download()` throws `OpenSubtitlesQuotaExceededException` (a subclass of `OpenSubtitlesException`) so callers can stop retrying or fall back to another provider.
 
 ## API
 
