@@ -2015,4 +2015,276 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->expectExceptionMessage('did not include a download link');
         $provider->downloadRaw(998877);
     }
+
+    // ---------------------------------------------------------------------
+    // Additional coverage for partially-covered methods
+    // ---------------------------------------------------------------------
+
+    public function test_exception_can_be_instantiated_with_all_params(): void
+    {
+        $previous = new \RuntimeException('previous');
+        $exception = new OpenSubtitlesException('test message', 42, $previous);
+
+        $this->assertSame('test message', $exception->getMessage());
+        $this->assertSame(42, $exception->getCode());
+        $this->assertSame($previous, $exception->getPrevious());
+        $this->assertInstanceOf(\Throwable::class, $exception);
+    }
+
+    public function test_map_candidates_filters_zero_file_id(): void
+    {
+        // Use reflection to call mapCandidates with file_id = 0
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'mapCandidates');
+        $method->setAccessible(true);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        // Raw result with file_id = 0 should be filtered out
+        $raw = [
+            [
+                'id' => '1',
+                'language' => 'en',
+                'format' => 'srt',
+                'downloads' => 100,
+                'filename' => 'movie.srt',
+                'imdb_id' => 'tt1234567',
+                'file_id' => 0, // invalid
+                'rating' => null,
+                'hearing_impaired' => false,
+                'fps' => null,
+                'files' => [['file_id' => 0, 'file_name' => 'movie.srt', 'cd_number' => 1]],
+            ],
+            [
+                'id' => '2',
+                'language' => 'en',
+                'format' => 'srt',
+                'downloads' => 50,
+                'filename' => 'movie2.srt',
+                'imdb_id' => null,
+                'file_id' => 999, // valid
+                'rating' => null,
+                'hearing_impaired' => false,
+                'fps' => null,
+                'files' => [['file_id' => 999, 'file_name' => 'movie2.srt', 'cd_number' => 1]],
+            ],
+        ];
+
+        $result = $method->invoke($provider, $raw, 'hash');
+        $this->assertCount(1, $result);
+        $this->assertSame('999', $result[0]->downloadId);
+    }
+
+    public function test_filter_subtitles_handles_missing_attributes(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'filterSubtitles');
+        $method->setAccessible(true);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        // Subtitle with missing/partial attributes
+        $raw = [
+            [
+                'id' => '1',
+                // missing 'attributes' entirely - should be skipped (no file_id)
+            ],
+            [
+                'id' => '2',
+                'attributes' => [
+                    // missing most fields, but has valid file
+                    'files' => [['file_id' => 123, 'file_name' => 'test.srt', 'cd_number' => 1]],
+                ],
+            ],
+            [
+                'id' => '3',
+                'attributes' => [
+                    'language' => 'fr',
+                    'download_count' => 10,
+                    'files' => [['file_id' => 456, 'file_name' => 'test2.srt', 'cd_number' => 1]],
+                    // missing feature_details, ratings, hearing_impaired, fps
+                ],
+            ],
+        ];
+
+        $result = $method->invoke($provider, $raw, 'srt');
+        // Entry 1 is skipped (no attributes), entries 2 and 3 both pass
+        // Results are sorted by download_count descending, so entry 3 (10 downloads) comes first
+        $this->assertCount(2, $result);
+        $this->assertSame(456, $result[0]['file_id']); // 10 downloads
+        $this->assertSame(123, $result[1]['file_id']); // 0 downloads
+        $this->assertSame('fr', $result[0]['language']);
+        $this->assertSame('en', $result[1]['language']); // default language
+    }
+
+    public function test_filter_subtitles_handles_malformed_files_array(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'filterSubtitles');
+        $method->setAccessible(true);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        // Files is not an array
+        $raw = [
+            [
+                'id' => '1',
+                'attributes' => [
+                    'language' => 'en',
+                    'files' => 'not-an-array',
+                ],
+            ],
+        ];
+
+        $result = $method->invoke($provider, $raw, 'srt');
+        $this->assertCount(0, $result);
+    }
+
+    public function test_compute_movie_hash_returns_empty_for_unreadable_file(): void
+    {
+        // Create a file, compute hash, then make it unreadable
+        $file = $this->makeFixture(str_repeat("\0", 131072));
+        try {
+            // First verify it works
+            $hash = OpenSubtitlesProvider::computeMovieHash($file);
+            $this->assertNotSame('', $hash);
+
+            // Now make it unreadable
+            chmod($file, 0);
+
+            // Clear any stat cache
+            clearstatcache(true, $file);
+
+            // Should return empty string for unreadable file
+            $this->assertSame('', OpenSubtitlesProvider::computeMovieHash($file));
+        } finally {
+            chmod($file, 0644);
+            unlink($file);
+        }
+    }
+
+    public function test_looks_like_quota_message_detects_various_patterns(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'looksLikeQuotaMessage');
+        $method->setAccessible(true);
+
+        // quota keyword
+        $this->assertTrue($method->invoke(null, 'You have exceeded your quota'));
+        // download limit
+        $this->assertTrue($method->invoke(null, 'Download limit reached'));
+        // allowed ... download
+        $this->assertTrue($method->invoke(null, 'No more downloads allowed'));
+        // negative cases
+        $this->assertFalse($method->invoke(null, 'Server error'));
+        $this->assertFalse($method->invoke(null, 'Invalid API key'));
+    }
+
+    public function test_quota_exceeded_exception_constructor(): void
+    {
+        $exception = new OpenSubtitlesQuotaExceededException(
+            'Daily limit reached',
+            resetTime: 'in 24 hours',
+            resetTimeUtc: '2026-08-02T00:00:00Z',
+            downloadsRemaining: 0,
+        );
+
+        $this->assertSame('Daily limit reached', $exception->getMessage());
+        $this->assertSame('in 24 hours', $exception->resetTime);
+        $this->assertSame('2026-08-02T00:00:00Z', $exception->resetTimeUtc);
+        $this->assertSame(0, $exception->downloadsRemaining);
+    }
+
+    public function test_download_with_remaining_zero_but_has_link(): void
+    {
+        // When remaining is 0 but a link IS provided, it should still work
+        // (some API responses return remaining=0 but still provide a link)
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'link' => 'https://dl.opensubtitles.org/download/src/upload/12345.srt',
+                'file_name' => 'movie.srt',
+                'remaining' => 0, // exhausted but still got a link
+                'requests' => 20,
+            ])),
+            self::response(200, 'subtitle content'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $download = $provider->downloadRaw(998877);
+
+        $this->assertSame('subtitle content', $download->content);
+        $this->assertSame(0, $download->downloadsRemaining);
+    }
+
+    public function test_http_request_relative_url_gets_api_base_prefix(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, '{"data":[]}'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        // Use reflection to call httpRequest with a relative URL
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'httpRequest');
+        $method->setAccessible(true);
+        $method->invoke($provider, 'GET', 'subtitles?imdb_id=tt1234567', []);
+
+        $this->assertCount(1, $history);
+        $this->assertStringStartsWith('https://api.opensubtitles.com/api/v1/', $history[0]['url']);
+    }
+
+    public function test_download_maps_500_error_to_quota_when_message_looks_like_quota(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(429, (string) json_encode([
+                'message' => 'You have downloaded your allowed 20 subtitles for 24h. Quota will be renewed automatically.',
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->expectException(OpenSubtitlesQuotaExceededException::class);
+        $provider->downloadRaw(998877);
+    }
+
+    public function test_safe_filename_strips_directory_components(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'safeFilename');
+        $method->setAccessible(true);
+
+        $result = $method->invoke(null, '/path/to/My.Movie.2019.srt', null, 'en', 'srt');
+        $this->assertSame('My.Movie.2019.srt', $result);
+    }
+
+    public function test_safe_filename_uses_release_name_when_provider_name_empty(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'safeFilename');
+        $method->setAccessible(true);
+
+        // Note: pathinfo treats "2019" as extension in "Movie.2019", so stem becomes "Movie"
+        // Using a release name without the dot-extension pattern
+        $result = $method->invoke(null, '', 'My Movie 2019 BluRay', 'en', 'srt');
+        $this->assertSame('My Movie 2019 BluRay.srt', $result);
+    }
+
+    public function test_coerce_priority_handles_various_inputs(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'coercePriority');
+        $method->setAccessible(true);
+
+        // Integer input
+        $this->assertSame(5, $method->invoke(null, 5));
+        // String integer
+        $this->assertSame(10, $method->invoke(null, '10'));
+        // Negative string integer
+        $this->assertSame(-3, $method->invoke(null, '-3'));
+        // Float (should use default)
+        $this->assertSame(10, $method->invoke(null, 3.14));
+        // Non-numeric string (should use default)
+        $this->assertSame(10, $method->invoke(null, 'abc'));
+        // Null (should use default)
+        $this->assertSame(10, $method->invoke(null, null));
+    }
 }

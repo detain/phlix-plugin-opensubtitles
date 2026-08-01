@@ -19,4 +19,18 @@ namespace Phlix\PluginOpenSubtitles;
  */
 class OpenSubtitlesException extends \RuntimeException
 {
+    /**
+     * Constructs the exception with a message and optional code and previous exception.
+     *
+     * @param string          $message  The exception message.
+     * @param int             $code     The exception code (defaults to 0).
+     * @param \Throwable|null $previous The previous throwable for chaining (defaults to null).
+     */
+    public function __construct(
+        string $message = '',
+        int $code = 0,
+        ?\Throwable $previous = null,
+    ) {
+        parent::__construct($message, $code, $previous);
+    }
 }
