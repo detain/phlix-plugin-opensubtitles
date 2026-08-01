@@ -1385,4 +1385,361 @@ final class OpenSubtitlesProviderTest extends TestCase
             }
         };
     }
+
+    // ---------------------------------------------------------------------
+    // Lifecycle (onDisable)
+    // ---------------------------------------------------------------------
+
+    public function test_on_disable_clears_session_token_and_disables(): void
+    {
+        $provider = new OpenSubtitlesProvider(
+            apiKey: self::TEST_API_KEY,
+            username: 'testuser',
+            password: 'testpass',
+        );
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode(['token' => 'session-token-123'])),
+            self::response(200, (string) json_encode(['data' => []])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        // First call triggers login
+        $provider->searchByFilenameRaw('movie.mkv');
+        $this->assertTrue($provider->isLoggedIn());
+        $this->assertCount(2, $history); // login + search
+
+        $provider->onDisable();
+
+        $this->assertFalse($provider->isLoggedIn());
+        // Verify provider is disabled by expecting exception
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessage('not enabled');
+        $provider->searchByFilenameRaw('movie.mkv');
+    }
+
+    // ---------------------------------------------------------------------
+    // Contract façade search methods (searchByPath, searchByHash, searchByImdbId)
+    // ---------------------------------------------------------------------
+
+    /**
+     * searchByPath (façade) delegates to searchByPathRaw which computes the hash.
+     * This test covers the actual façade method call path.
+     */
+    public function test_contract_search_by_path_facade_uses_hash_and_marks_match_hash(): void
+    {
+        $file = $this->makeFixture(str_repeat("\0", 131072));
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'data' => [[
+                    'id' => '1',
+                    'attributes' => [
+                        'language' => 'fr',
+                        'download_count' => 100,
+                        'files' => [['file_id' => 42, 'cd_number' => 1, 'file_name' => 'film.fr.srt']],
+                    ],
+                ]],
+            ])),
+        ], $history);
+
+        try {
+            $provider->onEnable($this->stubContainer());
+            $candidates = $provider->searchByPath($file, ['fr']);
+        } finally {
+            unlink($file);
+        }
+
+        $this->assertCount(1, $candidates);
+        $this->assertSame(SubtitleCandidate::MATCH_HASH, $candidates[0]->matchedBy);
+        $this->assertSame('fr', $candidates[0]->language);
+    }
+
+    /**
+     * searchByHash (façade) maps candidates with MATCH_HASH.
+     */
+    public function test_contract_search_by_hash_facade_maps_match_hash(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'data' => [[
+                    'id' => '99',
+                    'attributes' => [
+                        'language' => 'de',
+                        'download_count' => 50,
+                        'files' => [['file_id' => 77, 'cd_number' => 1, 'file_name' => 'movie.de.srt']],
+                    ],
+                ]],
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $candidates = $provider->searchByHash('8e245d9679d31e12', 12909756, ['de']);
+
+        $this->assertCount(1, $candidates);
+        $this->assertSame(SubtitleCandidate::MATCH_HASH, $candidates[0]->matchedBy);
+        $this->assertSame('77', $candidates[0]->downloadId);
+    }
+
+    /**
+     * searchByImdbId (façade) maps candidates with MATCH_IMDB.
+     */
+    public function test_contract_search_by_imdb_id_facade_maps_match_imdb(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'data' => [[
+                    'id' => '555',
+                    'attributes' => [
+                        'language' => 'es',
+                        'download_count' => 200,
+                        'files' => [['file_id' => 123, 'cd_number' => 1, 'file_name' => 'pelicula.es.srt']],
+                    ],
+                ]],
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $candidates = $provider->searchByImdbId('tt1234567', ['es']);
+
+        $this->assertCount(1, $candidates);
+        $this->assertSame(SubtitleCandidate::MATCH_IMDB, $candidates[0]->matchedBy);
+        $this->assertSame('es', $candidates[0]->language);
+    }
+
+    // ---------------------------------------------------------------------
+    // Private utility methods
+    // ---------------------------------------------------------------------
+
+    /**
+     * @dataProvider looksLikeQuotaMessageProvider
+     */
+    public function test_looks_like_quota_message(string $message, bool $expected): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'looksLikeQuotaMessage');
+        $method->setAccessible(true);
+
+        $this->assertSame($expected, $method->invoke(null, $message));
+    }
+
+    /** @return array<string, array{0: string, 1: bool}> */
+    public static function looksLikeQuotaMessageProvider(): array
+    {
+        return [
+            'quota word' => ['You have exceeded your quota', true],
+            'download limit' => ['You have reached your download limit', true],
+            'allowed download' => ['You have downloaded your allowed 20 subtitles', true],
+            'unrelated message' => ['Invalid API key', false],
+            'empty' => ['', false],
+            'quota mixed case' => ['Download Quota Exceeded', true],
+        ];
+    }
+
+    public function test_format_from_filename_returns_extension(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'formatFromFilename');
+        $method->setAccessible(true);
+
+        $this->assertSame('srt', $method->invoke(null, 'movie.srt'));
+        $this->assertSame('ass', $method->invoke(null, 'subtitle.ass'));
+        // formatFromFilename lowercases the extension
+        $this->assertSame('srt', $method->invoke(null, 'movie.SRT'));
+    }
+
+    public function test_format_from_filename_returns_null_for_empty_or_no_extension(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'formatFromFilename');
+        $method->setAccessible(true);
+
+        $this->assertNull($method->invoke(null, ''));
+        $this->assertNull($method->invoke(null, null));
+        $this->assertNull($method->invoke(null, 'movie'));
+    }
+
+    public function test_parse_filename_extracts_imdb_id(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'parseFilename');
+        $method->setAccessible(true);
+
+        $result = $method->invoke($provider, 'Movie.Name.2019.tt1234567.BRRip.srt');
+
+        $this->assertSame('tt1234567', $result['imdb_id']);
+    }
+
+    public function test_parse_filename_extracts_year(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'parseFilename');
+        $method->setAccessible(true);
+
+        $result = $method->invoke($provider, 'Movie Name 2019 720p bluray.mkv');
+
+        $this->assertSame(2019, $result['year']);
+        $this->assertSame('Movie Name', $result['title']);
+    }
+
+    public function test_parse_filename_returns_nulls_when_no_match(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'parseFilename');
+        $method->setAccessible(true);
+
+        // "some random filename" has no imdb_id and no year at the end
+        $result = $method->invoke($provider, 'some random filename');
+
+        $this->assertNull($result['imdb_id']);
+        $this->assertNull($result['year']);
+    }
+
+    /**
+     * @dataProvider languageFilterProvider
+     */
+    public function test_language_filter(array $languages, ?string $expected): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'languageFilter');
+        $method->setAccessible(true);
+
+        $this->assertSame($expected, $method->invoke(null, $languages));
+    }
+
+    /** @return array<string, array{0: list<string>, 1: ?string}> */
+    public static function languageFilterProvider(): array
+    {
+        return [
+            'empty array' => [[], null],
+            'single language' => [['en'], 'en'],
+            'multiple languages' => [['en', 'fr', 'de'], 'en,fr,de'],
+            'with whitespace' => [[' en ', ' fr '], 'en,fr'],
+            'with empty strings filtered out' => [['en', '', 'fr'], 'en,fr'],
+        ];
+    }
+
+    /**
+     * @dataProvider withLanguagesProvider
+     */
+    public function test_with_languages(array $params, ?string $languageCsv, array $expected): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'withLanguages');
+        $method->setAccessible(true);
+
+        $this->assertSame($expected, $method->invoke(null, $params, $languageCsv));
+    }
+
+    /** @return array<string, array{0: array<string, string>, 1: ?string, 2: array<string, string>}> */
+    public static function withLanguagesProvider(): array
+    {
+        return [
+            'no filter' => [['moviehash' => 'abc'], null, ['moviehash' => 'abc']],
+            'with filter' => [['moviehash' => 'abc'], 'en,fr', ['moviehash' => 'abc', 'languages' => 'en,fr']],
+            'empty params with filter' => [[], 'de', ['languages' => 'de']],
+        ];
+    }
+
+    /**
+     * @dataProvider safeFilenameProvider
+     */
+    public function test_safe_filename(string $providerName, ?string $releaseName, string $language, string $format, string $expected): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'safeFilename');
+        $method->setAccessible(true);
+
+        $this->assertSame($expected, $method->invoke(null, $providerName, $releaseName, $language, $format));
+    }
+
+    /** @return array<string, array{0: string, 1: ?string, 2: string, 3: string, 4: string}> */
+    public static function safeFilenameProvider(): array
+    {
+        return [
+            'normal filename' => ['movie.srt', null, 'en', 'srt', 'movie.srt'],
+            'path traversal stripped' => ['../../etc/evil.srt', null, 'en', 'srt', 'evil.srt'],
+            'directory in name stripped' => ['subtitles/movie.srt', null, 'en', 'srt', 'movie.srt'],
+            // Note: pathinfo treats .2020 in 'Movie.2020' as extension, so it becomes 'Movie.srt'
+            'empty provider name falls back to release name' => ['', 'Movie.2020', 'en', 'srt', 'Movie.srt'],
+            'empty provider name no release uses default' => ['', null, 'en', 'srt', 'subtitle.en.srt'],
+            'only extension provider name' => ['.', null, 'en', 'srt', 'subtitle.en.srt'],
+            'release name with year treated as extension' => ['', 'Great.Movie.1999', 'fr', 'ass', 'Great.Movie.ass'],
+        ];
+    }
+
+    /**
+     * @dataProvider floatOrNullProvider
+     */
+    public function test_float_or_null(mixed $value, ?float $expected): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'floatOrNull');
+        $method->setAccessible(true);
+
+        $this->assertSame($expected, $method->invoke(null, $value));
+    }
+
+    /** @return array<string, array{0: mixed, 1: ?float}> */
+    public static function floatOrNullProvider(): array
+    {
+        return [
+            'int' => [42, 42.0],
+            'float' => [3.14, 3.14],
+            'numeric string' => ['2.718', 2.718],
+            'null' => [null, null],
+            'non-numeric string' => ['hello', null],
+            'bool' => [true, null],
+        ];
+    }
+
+    /**
+     * @dataProvider truthyProvider
+     */
+    public function test_truthy(mixed $value, bool $expected): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'truthy');
+        $method->setAccessible(true);
+
+        $this->assertSame($expected, $method->invoke(null, $value));
+    }
+
+    /** @return array<string, array{0: mixed, 1: bool}> */
+    public static function truthyProvider(): array
+    {
+        return [
+            'true bool' => [true, true],
+            'false bool' => [false, false],
+            'int 1' => [1, true],
+            'int 0' => [0, false],
+            'string 1' => ['1', true],
+            'string true' => ['true', true],
+            'string FALSE' => ['FALSE', false],
+            'string 0' => ['0', false],
+            'null' => [null, false],
+            'empty string' => ['', false],
+        ];
+    }
+
+    // ---------------------------------------------------------------------
+    // getHttpClient lazy initialization
+    // ---------------------------------------------------------------------
+
+    public function test_get_http_client_lazily_initializes(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        // Use reflection to verify httpClient starts as null
+        $prop = new \ReflectionProperty(OpenSubtitlesProvider::class, 'httpClient');
+        $prop->setAccessible(true);
+        $this->assertNull($prop->getValue($provider));
+
+        // getHttpClient should create it
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'getHttpClient');
+        $method->setAccessible(true);
+        $client = $method->invoke($provider);
+
+        $this->assertInstanceOf(\Workerman\Http\Client::class, $client);
+        $this->assertNotNull($prop->getValue($provider));
+    }
 }
