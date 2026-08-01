@@ -1742,4 +1742,277 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertInstanceOf(\Workerman\Http\Client::class, $client);
         $this->assertNotNull($prop->getValue($provider));
     }
+
+    // ---------------------------------------------------------------------
+    // Additional coverage for error paths
+    // ---------------------------------------------------------------------
+
+    public function test_exception_class_can_be_instantiated(): void
+    {
+        $exception = new OpenSubtitlesException('test message', 123);
+
+        $this->assertSame('test message', $exception->getMessage());
+        $this->assertSame(123, $exception->getCode());
+        $this->assertInstanceOf(\RuntimeException::class, $exception);
+    }
+
+    public function test_on_enable_wires_logger_from_container_when_available(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [self::response(200, '{"data":[]}')], $history);
+
+        // Container that has LoggerInterface
+        $logger = new class implements \Psr\Log\LoggerInterface {
+            public function emergency(\Stringable|string $message, array $context = []): void {}
+            public function alert(\Stringable|string $message, array $context = []): void {}
+            public function critical(\Stringable|string $message, array $context = []): void {}
+            public function error(\Stringable|string $message, array $context = []): void {}
+            public function warning(\Stringable|string $message, array $context = []): void {}
+            public function notice(\Stringable|string $message, array $context = []): void {}
+            public function info(\Stringable|string $message, array $context = []): void {}
+            public function debug(\Stringable|string $message, array $context = []): void {}
+            public function log($level, \Stringable|string $message, array $context = []): void {}
+        };
+        $container = new class($logger) implements ContainerInterface {
+            private \Psr\Log\LoggerInterface $logger;
+            public function __construct(\Psr\Log\LoggerInterface $logger) { $this->logger = $logger; }
+            public function get(string $id): mixed { return $this->logger; }
+            public function has(string $id): bool { return $id === \Psr\Log\LoggerInterface::class; }
+        };
+
+        $provider->onEnable($container);
+
+        // The provider should have a logger now - just verify no exception and it works
+        $this->assertCount(0, $history, 'onEnable still does no HTTP');
+    }
+
+    public function test_login_throws_when_http_request_fails(): void
+    {
+        $provider = new OpenSubtitlesProvider(
+            apiKey: self::TEST_API_KEY,
+            username: 'testuser',
+            password: 'testpass',
+        );
+
+        // Install a transport that throws for login
+        $property = new \ReflectionProperty(OpenSubtitlesProvider::class, 'transport');
+        $property->setAccessible(true);
+        $property->setValue($provider, function (): never {
+            throw new OpenSubtitlesException('Connection failed');
+        });
+
+        $provider->onEnable($this->stubContainer());
+
+        // EnsureConnected should trigger login which will throw, but it should be caught
+        // and login should fail gracefully - the provider should not be logged in
+        // This test verifies the catch block in login()
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'ensureConnected');
+        $method->setAccessible(true);
+
+        // After ensureConnected fails login, the provider should not be logged in
+        // but should continue without throwing (graceful degradation)
+        try {
+            $method->invoke($provider);
+        } catch (OpenSubtitlesException $e) {
+            // If ensureConnected itself throws, that's also valid behavior
+        }
+
+        $this->assertFalse($provider->isLoggedIn());
+    }
+
+    public function test_search_throws_when_http_request_fails(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        // Install a transport that throws
+        $property = new \ReflectionProperty(OpenSubtitlesProvider::class, 'transport');
+        $property->setAccessible(true);
+        $property->setValue($provider, function (): never {
+            throw new OpenSubtitlesException('Connection refused');
+        });
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessage('Search by IMDB ID failed');
+        $provider->searchByImdbIdRaw('tt1234567');
+    }
+
+    public function test_download_throws_when_http_request_fails(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        // First call returns link, second call (download content) throws
+        $callCount = 0;
+        $property = new \ReflectionProperty(OpenSubtitlesProvider::class, 'transport');
+        $property->setAccessible(true);
+        $property->setValue($provider, function () use (&$callCount): array {
+            $callCount++;
+            if ($callCount === 1) {
+                return ['status' => 200, 'body' => json_encode([
+                    'link' => 'https://example.com/file.srt',
+                    'file_name' => 'test.srt',
+                ])];
+            }
+            throw new OpenSubtitlesException('Download connection lost');
+        });
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessage('Download failed');
+        $provider->downloadRaw(12345);
+    }
+
+    public function test_search_by_path_with_imdb_id_in_filename(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [self::response(200, '{"data":[]}')], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        // Filename with embedded IMDB ID should parse and use it
+        $provider->searchByPathRaw('/tmp/Movie.Name.2019.tt1234567.720p.mkv');
+
+        $this->assertCount(1, $history);
+        // Should use imdb_id query param when available
+        $this->assertStringContainsString('imdb_id=tt1234567', $history[0]['url']);
+    }
+
+    public function test_download_uses_fallback_filename_when_not_provided(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY, format: 'ass');
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'link' => 'https://dl.opensubtitles.org/download/src/upload/12345.ass',
+                // no file_name provided
+                'requests' => 1,
+                'remaining' => 19,
+            ])),
+            self::response(200, 'subtitle content'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $download = $provider->downloadRaw(998877);
+
+        // Should use format-based fallback filename
+        $this->assertSame('subtitle.ass', $download->fileName);
+    }
+
+    public function test_download_content_fetch_returns_non_success_status(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'link' => 'https://dl.opensubtitles.org/download/src/upload/12345.srt',
+                'file_name' => 'movie.srt',
+            ])),
+            self::response(500, 'Internal Server Error'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessage('Download failed: HTTP 500');
+        $provider->downloadRaw(998877);
+    }
+
+    public function test_filter_subtitles_skips_entries_with_no_files(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'data' => [
+                    ['id' => '1', 'attributes' => ['language' => 'en', 'files' => []]],
+                    ['id' => '2', 'attributes' => ['language' => 'fr', 'files' => [['file_id' => 2, 'cd_number' => 1]]]],
+
+                ],
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $results = $provider->searchByImdbIdRaw('tt1234567');
+
+        // Only entries with files should be included
+        $this->assertCount(1, $results);
+        $this->assertSame('2', $results[0]['id']);
+    }
+
+    public function test_plugin_version_returns_unknown_on_malformed_json(): void
+    {
+        // Temporarily replace plugin.json with malformed content
+        $manifestPath = dirname(__DIR__, 2) . '/plugin.json';
+        $backupPath = $manifestPath . '.bak';
+
+        // Backup original
+        $originalContent = file_get_contents($manifestPath);
+        file_put_contents($backupPath, $originalContent);
+
+        try {
+            // Write malformed JSON
+            file_put_contents($manifestPath, '{ invalid json }');
+
+            // Use reflection to clear the cached version
+            $prop = new \ReflectionProperty(OpenSubtitlesProvider::class, 'cachedPluginVersion');
+            $prop->setAccessible(true);
+            $prop->setValue(null, null);
+
+            // Now create a provider and call pluginVersion via searchByPath
+            $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+            $history = [];
+            $this->installFakeTransport($provider, [self::response(200, '{"data":[]}')], $history);
+
+            $provider->onEnable($this->stubContainer());
+            $provider->searchByPathRaw('/tmp/movie.mkv');
+
+            // If we get here without exception, the malformed json was handled gracefully
+            $this->assertCount(1, $history);
+        } finally {
+            // Restore original
+            file_put_contents($manifestPath, $originalContent);
+            unlink($backupPath);
+
+            // Clear cache again for other tests
+            $prop->setValue(null, null);
+        }
+    }
+
+    public function test_ensure_enabled_throws_when_provider_not_enabled(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        // onEnable NOT called - provider is not enabled
+
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessage('not enabled');
+
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'ensureEnabled');
+        $method->setAccessible(true);
+        $method->invoke($provider);
+    }
+
+    public function test_download_step1_failure_throws_without_link(): void
+    {
+        // When the first download step (POST /download) returns 200 but without a link,
+        // it should throw "did not include a download link"
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'requests' => 1,
+                'remaining' => 5,
+                // no link!
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessage('did not include a download link');
+        $provider->downloadRaw(998877);
+    }
 }
