@@ -242,15 +242,26 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      */
     public function configure(array $settings): void
     {
-        $this->apiKey = is_string($settings['api_key'] ?? null) ? $settings['api_key'] : '';
+        $apiKey = $settings['api_key'] ?? null;
+        $this->apiKey = is_string($apiKey) ? $apiKey : '';
+
         $this->username = self::nonEmptyString($settings['username'] ?? null);
         $this->password = self::nonEmptyString($settings['password'] ?? null);
-        $this->language = is_string($settings['language'] ?? null) && $settings['language'] !== ''
-            ? $settings['language']
-            : self::DEFAULT_LANGUAGE;
-        $this->format = is_string($settings['format'] ?? null) && $settings['format'] !== ''
-            ? $settings['format']
-            : self::DEFAULT_FORMAT;
+
+        $language = $settings['language'] ?? null;
+        if (is_string($language) && $language !== '') {
+            $this->language = $language;
+        } else {
+            $this->language = self::DEFAULT_LANGUAGE;
+        }
+
+        $format = $settings['format'] ?? null;
+        if (is_string($format) && $format !== '') {
+            $this->format = $format;
+        } else {
+            $this->format = self::DEFAULT_FORMAT;
+        }
+
         $this->priority = self::coercePriority($settings['priority'] ?? null);
 
         // Credentials may have changed — allow a fresh deferred login on next use.
@@ -302,7 +313,11 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      */
     private static function nonEmptyString(mixed $value): ?string
     {
-        return is_string($value) && $value !== '' ? $value : null;
+        if (is_string($value) && $value !== '') {
+            return $value;
+        }
+
+        return null;
     }
 
     /**
@@ -1090,8 +1105,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
                 $state['body'] = $response->getBody()->getContents();
                 $state['done'] = true;
             },
-            'error' => function (Throwable $e) use (&$state): void {
-                $state['error'] = $e;
+            'error' => function (Throwable $error) use (&$state): void {
+                $state['error'] = $error;
                 $state['done'] = true;
             },
         ];

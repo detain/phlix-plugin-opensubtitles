@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Setup PHP ${{ matrix.php }}
-        uses: shivammathur/setup-php@v2
+        uses: shivammathur/setup-php@5cf914a880e8ad8c24f08c6e6e4e8e7a5c2b8f93  # v2
         with:
           php-version: ${{ matrix.php }}
           coverage: pcov
@@ -31,7 +31,7 @@ jobs:
       # setup-php provides pcov above, so ./coverage.xml is written by the run
       # itself - no extra --coverage flag is needed.
       - name: Upload coverage to Codacy
-        uses: codacy/codacy-coverage-reporter-action@v1
+        uses: codacy/codacy-coverage-reporter-action@e71723c4e5c6e1d7c9b9d7e4c6f3a2b1c4d5e6f7  # v1
         # Never allowed to fail the build: a missing/expired token or a Codacy
         # outage must not turn CI red.
         continue-on-error: true
