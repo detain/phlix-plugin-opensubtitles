@@ -2287,4 +2287,391 @@ final class OpenSubtitlesProviderTest extends TestCase
         // Null (should use default)
         $this->assertSame(10, $method->invoke(null, null));
     }
+
+    // ---------------------------------------------------------------------
+    // Additional coverage for uncovered code paths
+    // ---------------------------------------------------------------------
+
+    /**
+     * Covers filterSubtitles lines 1291-1292: when subtitle id is an integer
+     * instead of a string (API can return either).
+     */
+    public function test_filter_subtitles_handles_integer_id(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'filterSubtitles');
+        $method->setAccessible(true);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        // API returns integer id instead of string
+        $raw = [
+            [
+                'id' => 123456, // integer id, not string
+                'attributes' => [
+                    'language' => 'en',
+                    'download_count' => 100,
+                    'files' => [['file_id' => 998877, 'file_name' => 'test.srt', 'cd_number' => 1]],
+                ],
+            ],
+        ];
+
+        $result = $method->invoke($provider, $raw, 'srt');
+        $this->assertCount(1, $result);
+        $this->assertSame('123456', $result[0]['id']);
+    }
+
+    /**
+     * Covers filterSubtitles line 1260: when file_id is present but not an int
+     * (e.g., it's a string), the entry should be skipped.
+     */
+    public function test_filter_subtitles_skips_files_with_non_int_file_id(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'filterSubtitles');
+        $method->setAccessible(true);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        // First entry has string file_id, second has valid int file_id
+        $raw = [
+            [
+                'id' => '1',
+                'attributes' => [
+                    'language' => 'en',
+                    'download_count' => 100,
+                    'files' => [['file_id' => 'not-an-int', 'file_name' => 'bad.srt', 'cd_number' => 1]],
+                ],
+            ],
+            [
+                'id' => '2',
+                'attributes' => [
+                    'language' => 'fr',
+                    'download_count' => 50,
+                    'files' => [['file_id' => 123456, 'file_name' => 'good.srt', 'cd_number' => 1]],
+                ],
+            ],
+        ];
+
+        $result = $method->invoke($provider, $raw, 'srt');
+        // Only the second entry should pass (file_id is int)
+        $this->assertCount(1, $result);
+        $this->assertSame(123456, $result[0]['file_id']);
+    }
+
+    /**
+     * Covers filterSubtitles: files array with mixed valid/invalid file entries.
+     * Some files have string file_id, one has valid int file_id.
+     */
+    public function test_filter_subtitles_handles_mixed_file_validity(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'filterSubtitles');
+        $method->setAccessible(true);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $raw = [
+            [
+                'id' => '1',
+                'attributes' => [
+                    'language' => 'en',
+                    'download_count' => 100,
+                    'files' => [
+                        ['file_id' => 'bad', 'file_name' => 'a.srt', 'cd_number' => 1],
+                        ['file_id' => 999, 'file_name' => 'b.srt', 'cd_number' => 1],
+                    ],
+                ],
+            ],
+        ];
+
+        $result = $method->invoke($provider, $raw, 'srt');
+        // Only the entry with valid file_id (999) should be kept
+        $this->assertCount(1, $result);
+        $this->assertSame(999, $result[0]['file_id']);
+    }
+
+    /**
+     * Covers downloadRaw lines 935-938: when httpRequest throws an OpenSubtitlesException,
+     * it should be caught, logged, and re-thrown as a new exception.
+     */
+    public function test_download_raw_catches_http_request_exception(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        // Create a transport that throws an OpenSubtitlesException
+        $transport = function (string $method, string $url, array $headers, ?string $body) use (&$history): array {
+            throw new OpenSubtitlesException('Connection refused');
+        };
+
+        $property = new \ReflectionProperty(OpenSubtitlesProvider::class, 'transport');
+        $property->setAccessible(true);
+        $property->setValue($provider, $transport);
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessage('Download failed: Connection refused');
+        $provider->downloadRaw(12345);
+    }
+
+    /**
+     * Covers filterSubtitles edge case: file entry is not an array at all.
+     */
+    public function test_filter_subtitles_handles_non_array_file_entry(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'filterSubtitles');
+        $method->setAccessible(true);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        // files contains a non-array entry
+        $raw = [
+            [
+                'id' => '1',
+                'attributes' => [
+                    'language' => 'en',
+                    'download_count' => 100,
+                    'files' => [
+                        'not-an-array',
+                        ['file_id' => 123, 'file_name' => 'test.srt', 'cd_number' => 1],
+                    ],
+                ],
+            ],
+        ];
+
+        $result = $method->invoke($provider, $raw, 'srt');
+        $this->assertCount(1, $result);
+        $this->assertSame(123, $result[0]['file_id']);
+    }
+
+    /**
+     * Covers filterSubtitles edge case: cd_number is not an int.
+     */
+    public function test_filter_subtitles_handles_non_int_cd_number(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'filterSubtitles');
+        $method->setAccessible(true);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $raw = [
+            [
+                'id' => '1',
+                'attributes' => [
+                    'language' => 'en',
+                    'download_count' => 100,
+                    'files' => [['file_id' => 123, 'file_name' => 'test.srt', 'cd_number' => '1']],
+                ],
+            ],
+        ];
+
+        $result = $method->invoke($provider, $raw, 'srt');
+        $this->assertCount(1, $result);
+        // cd_number should default to 1 when not an int
+        $this->assertSame(1, $result[0]['files'][0]['cd_number']);
+    }
+
+    /**
+     * Covers filterSubtitles: empty id field should result in empty string id.
+     */
+    public function test_filter_subtitles_handles_missing_id(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'filterSubtitles');
+        $method->setAccessible(true);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $raw = [
+            [
+                'id' => null,
+                'attributes' => [
+                    'language' => 'en',
+                    'download_count' => 100,
+                    'files' => [['file_id' => 123, 'file_name' => 'test.srt', 'cd_number' => 1]],
+                ],
+            ],
+        ];
+
+        $result = $method->invoke($provider, $raw, 'srt');
+        $this->assertCount(1, $result);
+        $this->assertSame('', $result[0]['id']);
+    }
+
+    /**
+     * Covers filterSubtitles: imdb_id is an empty string should be null.
+     */
+    public function test_filter_subtitles_handles_empty_imdb_id(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'filterSubtitles');
+        $method->setAccessible(true);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $raw = [
+            [
+                'id' => '1',
+                'attributes' => [
+                    'language' => 'en',
+                    'download_count' => 100,
+                    'feature_details' => ['imdb_id' => ''], // empty string
+                    'files' => [['file_id' => 123, 'file_name' => 'test.srt', 'cd_number' => 1]],
+                ],
+            ],
+        ];
+
+        $result = $method->invoke($provider, $raw, 'srt');
+        $this->assertCount(1, $result);
+        $this->assertNull($result[0]['imdb_id']);
+    }
+
+    /**
+     * Covers filterSubtitles: hearing_impaired can be a string "1" or "true".
+     */
+    public function test_filter_subtitles_handles_string_hearing_impaired(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'filterSubtitles');
+        $method->setAccessible(true);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $raw = [
+            [
+                'id' => '1',
+                'attributes' => [
+                    'language' => 'en',
+                    'download_count' => 100,
+                    'hearing_impaired' => 'true', // string instead of bool
+                    'files' => [['file_id' => 123, 'file_name' => 'test.srt', 'cd_number' => 1]],
+                ],
+            ],
+        ];
+
+        $result = $method->invoke($provider, $raw, 'srt');
+        $this->assertCount(1, $result);
+        $this->assertTrue($result[0]['hearing_impaired']);
+    }
+
+    /**
+     * Covers filterSubtitles: ratings can be a numeric string.
+     */
+    public function test_filter_subtitles_handles_string_rating(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'filterSubtitles');
+        $method->setAccessible(true);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $raw = [
+            [
+                'id' => '1',
+                'attributes' => [
+                    'language' => 'en',
+                    'download_count' => 100,
+                    'ratings' => '8.5', // string instead of float
+                    'files' => [['file_id' => 123, 'file_name' => 'test.srt', 'cd_number' => 1]],
+                ],
+            ],
+        ];
+
+        $result = $method->invoke($provider, $raw, 'srt');
+        $this->assertCount(1, $result);
+        $this->assertSame(8.5, $result[0]['rating']);
+    }
+
+    /**
+     * Covers filterSubtitles: fps can be an int that needs float conversion.
+     */
+    public function test_filter_subtitles_handles_int_fps(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'filterSubtitles');
+        $method->setAccessible(true);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $raw = [
+            [
+                'id' => '1',
+                'attributes' => [
+                    'language' => 'en',
+                    'download_count' => 100,
+                    'fps' => 24, // int instead of float
+                    'files' => [['file_id' => 123, 'file_name' => 'test.srt', 'cd_number' => 1]],
+                ],
+            ],
+        ];
+
+        $result = $method->invoke($provider, $raw, 'srt');
+        $this->assertCount(1, $result);
+        $this->assertSame(24.0, $result[0]['fps']);
+    }
+
+    /**
+     * Covers filterSubtitles: when file_name is null, uses default.
+     */
+    public function test_filter_subtitles_handles_null_file_name(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'filterSubtitles');
+        $method->setAccessible(true);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $raw = [
+            [
+                'id' => '1',
+                'attributes' => [
+                    'language' => 'en',
+                    'download_count' => 100,
+                    'files' => [['file_id' => 123, 'file_name' => null, 'cd_number' => 1]],
+                ],
+            ],
+        ];
+
+        $result = $method->invoke($provider, $raw, 'srt');
+        $this->assertCount(1, $result);
+        // Should default to "subtitle.srt"
+        $this->assertSame('subtitle.srt', $result[0]['filename']);
+    }
+
+    /**
+     * Covers filterSubtitles: results are sorted by download_count descending.
+     */
+    public function test_filter_subtitles_sorts_by_download_count_descending(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'filterSubtitles');
+        $method->setAccessible(true);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $raw = [
+            [
+                'id' => '1',
+                'attributes' => [
+                    'language' => 'en',
+                    'download_count' => 10,
+                    'files' => [['file_id' => 1, 'file_name' => 'a.srt', 'cd_number' => 1]],
+                ],
+            ],
+            [
+                'id' => '2',
+                'attributes' => [
+                    'language' => 'en',
+                    'download_count' => 1000,
+                    'files' => [['file_id' => 2, 'file_name' => 'b.srt', 'cd_number' => 1]],
+                ],
+            ],
+            [
+                'id' => '3',
+                'attributes' => [
+                    'language' => 'en',
+                    'download_count' => 100,
+                    'files' => [['file_id' => 3, 'file_name' => 'c.srt', 'cd_number' => 1]],
+                ],
+            ],
+        ];
+
+        $result = $method->invoke($provider, $raw, 'srt');
+        $this->assertCount(3, $result);
+        // Should be sorted: 1000 (id=2), 100 (id=3), 10 (id=1)
+        $this->assertSame(1000, $result[0]['downloads']);
+        $this->assertSame(100, $result[1]['downloads']);
+        $this->assertSame(10, $result[2]['downloads']);
+    }
 }
