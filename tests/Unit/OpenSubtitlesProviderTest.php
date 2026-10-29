@@ -703,6 +703,216 @@ final class OpenSubtitlesProviderTest extends TestCase
     }
 
     // ---------------------------------------------------------------------
+    // Search envelope fail-loud (review opensubtitles__srphp C2)
+    //
+    // A 2xx body that is undecodable or lacks the expected `data` envelope
+    // must surface through the provider's established OpenSubtitlesException
+    // idiom — never collapse to `[]`. `[]` is reserved for parsed, valid,
+    // genuinely-empty results, so callers (and their empty-result caching)
+    // can tell "no subtitles exist" apart from "the call failed".
+    // ---------------------------------------------------------------------
+
+    public function test_search_undecodable_2xx_body_fails_loud_instead_of_empty_collapse(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        // Captive-portal / gateway HTML served with a 200 — the classic
+        // shape whose json_decode yields null.
+        $this->installFakeTransport($provider, [
+            self::response(200, '<html><body>504 Gateway Time-out</body></html>'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessage('Search by IMDB ID failed: response body was not a valid JSON envelope');
+        $provider->searchByImdbIdRaw('tt1234567');
+    }
+
+    public function test_search_truncated_json_2xx_body_fails_loud_instead_of_empty_collapse(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        // A stream cut mid-envelope: starts as the real shape but is
+        // syntactically incomplete.
+        $this->installFakeTransport($provider, [
+            self::response(200, '{"data": [{"id": "1", "attrib'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessage('Search by hash failed: response body was not a valid JSON envelope');
+        $provider->searchByHashRaw('8e245d9679d31e12', 12909756);
+    }
+
+    public function test_search_scalar_json_body_is_not_accepted_as_an_envelope(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        // Decodes fine, but a bare scalar is not a response envelope.
+        $this->installFakeTransport($provider, [
+            self::response(200, '123'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessage('Search by filename failed: response body was not a valid JSON envelope');
+        $provider->searchByFilenameRaw('Movie.2019.1080p.mkv');
+    }
+
+    public function test_search_valid_json_without_data_list_fails_loud(): void
+    {
+        // Error-in-200: parseable JSON object with no `data` list — a
+        // failure masquerading as success under the old collapse.
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, '{"message":"internal error","code":500}'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessage('Search by IMDB ID failed: response envelope did not include a data list');
+        $provider->searchByImdbIdRaw('tt1234567');
+    }
+
+    public function test_search_top_level_json_array_body_fails_loud_without_data_list(): void
+    {
+        // A JSON list at the top level (foreign/wrong shape) decodes to an
+        // array but carries no `data` key — same failure class.
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, '[{"id":"1"}]'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessage('Search by hash failed: response envelope did not include a data list');
+        $provider->searchByHashRaw('8e245d9679d31e12', 12909756);
+    }
+
+    public function test_search_valid_empty_data_envelope_still_returns_empty_array(): void
+    {
+        // Negative contract (guards against overcorrection): a parsed,
+        // valid, genuinely-empty result set stays `[]` — never an exception.
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'data' => [],
+                'jsonapi' => ['version' => '1.0'],
+                'paging' => ['page' => 1, 'total_pages' => 1, 'total_results' => 0],
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->assertSame([], $provider->searchByImdbIdRaw('tt1234567'));
+    }
+
+    public function test_search_failure_is_the_shared_exception_and_surfaces_through_the_typed_facade(): void
+    {
+        // Consumer-facing proof: the host pipeline calls the typed
+        // searchByImdbId façade — an envelope failure there must throw the
+        // shared OpenSubtitlesException, not hand back an empty candidate
+        // list the pipeline would cache as "provider has nothing".
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, 'not json at all'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->searchByImdbId('tt1234567', ['en']);
+            $this->fail('envelope failure must surface as OpenSubtitlesException, not an empty candidate list');
+        } catch (OpenSubtitlesException $e) {
+            $this->assertStringContainsString('Search by IMDB ID failed', $e->getMessage());
+        }
+    }
+
+    public function test_search_envelope_failure_message_never_echoes_response_body(): void
+    {
+        // Actionable context (which search, why) with zero body content:
+        // OS session tokens are secrets, and error-in-200/intercepted
+        // bodies may carry arbitrary sensitive values.
+        $canary = 'Authorization: Bearer session-token-CANARY-MUST-NOT-ECHO';
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode(['credentials' => $canary, 'unexpected' => true])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->searchByFilenameRaw('Movie.2019.1080p.mkv');
+            $this->fail('expected envelope failure');
+        } catch (OpenSubtitlesException $e) {
+            $this->assertStringContainsString('Search by filename failed', $e->getMessage());
+            $this->assertStringContainsString('did not include a data list', $e->getMessage());
+            $this->assertStringNotContainsString($canary, $e->getMessage());
+            $this->assertStringNotContainsString('CANARY', $e->getMessage());
+        }
+    }
+
+    public function test_login_2xx_without_token_logs_and_stays_anonymous(): void
+    {
+        // Login is optional-by-design (non-throwing), but its documented
+        // contract is "failure is logged" — a 2xx missing the token must
+        // not degrade silently, and must still let the search proceed.
+        $logger = new class extends \Psr\Log\NullLogger {
+            /** @var list<string> */
+            public array $warnings = [];
+
+            public function warning(\Stringable|string $message, array $context = []): void
+            {
+                $this->warnings[] = (string) $message;
+            }
+        };
+        $container = new class($logger) implements ContainerInterface {
+            private \Psr\Log\LoggerInterface $logger;
+            public function __construct(\Psr\Log\LoggerInterface $logger)
+            {
+                $this->logger = $logger;
+            }
+            public function get(string $id): mixed
+            {
+                return $this->logger;
+            }
+            public function has(string $id): bool
+            {
+                return $id === \Psr\Log\LoggerInterface::class;
+            }
+        };
+
+        $provider = new OpenSubtitlesProvider(
+            apiKey: self::TEST_API_KEY,
+            username: 'u',
+            password: 'p',
+        );
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, '{"unexpected":"shape"}'),
+            self::response(200, '{"data":[]}'),
+        ], $history);
+
+        $provider->onEnable($container);
+        $results = $provider->searchByImdbIdRaw('tt1234567');
+
+        $this->assertFalse($provider->isLoggedIn());
+        $this->assertSame([], $results, 'login degradation must not break the search itself');
+        $this->assertNotEmpty($logger->warnings, 'tokenless 2xx login must not be silent');
+        $this->assertStringContainsString('did not include a usable session token', $logger->warnings[0]);
+    }
+
+    // ---------------------------------------------------------------------
     // Download two-step flow
     // ---------------------------------------------------------------------
 

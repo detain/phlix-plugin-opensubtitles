@@ -457,6 +457,11 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         if (is_array($data) && isset($data['token']) && is_string($data['token'])) {
             $this->sessionToken = $data['token'];
             $this->logger->info('OpenSubtitles login successful');
+        } else {
+            // The class contract is "a failure is logged and the provider stays
+            // anonymous" — a 2xx without a usable token was previously silent.
+            // Keep it non-throwing (login is optional by design) but loud.
+            $this->logger->warning('OpenSubtitles login response did not include a usable session token');
         }
     }
 
@@ -888,7 +893,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
      * }>
      *
-     * @throws OpenSubtitlesException When the search fails.
+     * @throws OpenSubtitlesException When the search fails — including a 2xx
+     *         response whose body is not valid JSON or lacks the expected
+     *         `data` envelope (never collapsed to an empty result).
      */
     private function searchSubtitles(array $queryParams, string $subtitleFormat, string $context): array
     {
@@ -910,8 +917,31 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
 
         $data = json_decode($response['body'], true);
 
+        // Fail-vs-empty separation (review opensubtitles__srphp C2): `[]` is
+        // reserved for a parsed, valid, genuinely-empty `data` envelope. A 2xx
+        // body that is not decodable JSON, or decodes without the expected
+        // `data` list (gateway HTML page, truncated stream, error-in-200), is a
+        // FAILURE and must surface as one — callers (and their empty-result
+        // caching) must never see a broken call reported as "no subtitles".
+        // Response content is deliberately NOT interpolated into the message.
+        if (!is_array($data)) {
+            $reason = 'response body was not a valid JSON envelope';
+
+            $this->logger->error("OpenSubtitles search by {$context} failed: {$reason}");
+
+            throw new OpenSubtitlesException("Search by {$context} failed: {$reason}");
+        }
+
+        if (!is_array($data['data'] ?? null)) {
+            $reason = 'response envelope did not include a data list';
+
+            $this->logger->error("OpenSubtitles search by {$context} failed: {$reason}");
+
+            throw new OpenSubtitlesException("Search by {$context} failed: {$reason}");
+        }
+
         /** @var list<array<string, mixed>> $subtitles */
-        $subtitles = is_array($data) && is_array($data['data'] ?? null) ? array_values($data['data']) : [];
+        $subtitles = array_values($data['data']);
 
         return $this->filterSubtitles($subtitles, $subtitleFormat);
     }
