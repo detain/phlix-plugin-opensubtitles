@@ -118,6 +118,23 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     private const HTTP_TIMEOUT_SEC = 30;
 
     /**
+     * Hard cap (bytes) on any single HTTP response body — search/login/link
+     * JSON and downloaded subtitle content alike.
+     *
+     * Realistic subtitle files range from sub-MiB SRT to a few MiB of
+     * style-heavy ASS; 10 MiB sits an order of magnitude above legitimate
+     * payloads and far below what threatens a resident worker's memory.
+     * An over-cap response fails loud as {@see OpenSubtitlesException} —
+     * never truncated, never delivered as a partial or empty "success".
+     * On the real transport the `progress` guard in {@see httpRequest()}
+     * aborts the stream the moment the cap is crossed, so the oversized body
+     * is never fully buffered by the plugin (the vendored workerman client
+     * itself has no size option; the throw rides its error path and closes
+     * the connection).
+     */
+    private const MAX_RESPONSE_BYTES = 10_485_760;
+
+    /**
      * Chunk size (bytes) read from the head and tail of a media file for the
      * OpenSubtitles `moviehash` — 64 KiB, per the algorithm specification.
      */
@@ -584,7 +601,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * run the two-step download and returns a shared {@see SubtitleFile}. THIS is
      * the quota-consuming step: a provider quota exhaustion is surfaced as the
      * shared {@see QuotaExceeded}, carrying the remaining allowance and reset
-     * time when OpenSubtitles reports them.
+     * time when OpenSubtitles reports them. The returned file's `encoding`
+     * claim is verified: bytes that are not valid UTF-8 fail loud rather than
+     * being labelled as such.
      *
      * @param SubtitleCandidate $candidate The chosen candidate to download.
      *
@@ -615,6 +634,17 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $format = $raw->format !== '' ? $raw->format : $candidate->format;
         $language = $candidate->language;
         $releaseName = $candidate->releaseName !== '' ? $candidate->releaseName : null;
+
+        // SubtitleFile carries an `encoding` claim the host trusts, so only a
+        // validated UTF-8 byte sequence may be labelled as such. Binary or
+        // foreign-encoded payloads (mis-uploads, a compressed body that
+        // slipped past the `identity` request) fail loud here rather than
+        // persist downstream as "UTF-8" subtitle garbage.
+        if (!mb_check_encoding($raw->content, 'UTF-8')) {
+            $this->logger->error('OpenSubtitles download failed: content is not valid UTF-8');
+
+            throw new OpenSubtitlesException('Downloaded subtitle content is not valid UTF-8');
+        }
 
         return new SubtitleFile(
             language: $language,
@@ -964,7 +994,11 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             : "subtitle.{$this->format}";
 
         try {
-            $contentResponse = $this->httpRequest('GET', $link);
+            // Make the wire contract explicit: this plugin does not decode
+            // Content-Encoding, and download() only asserts UTF-8 for bytes
+            // it validates as text — so ask the link host for neither
+            // compression nor (by failing validation) mislabelled payloads.
+            $contentResponse = $this->httpRequest('GET', $link, ['Accept-Encoding' => 'identity']);
         } catch (OpenSubtitlesException $e) {
             $this->logger->error('OpenSubtitles download failed: ' . $e->getMessage());
 
@@ -1072,7 +1106,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *
      * Returns the status code and body for EVERY HTTP response (including 4xx /
      * 5xx) rather than throwing on error status — callers inspect the status.
-     * Only genuine transport failures (connection/timeout) throw.
+     * Only genuine transport failures (connection/timeout) and over-cap
+     * response bodies throw; see {@see MAX_RESPONSE_BYTES}.
      *
      * @param string                $method  HTTP method.
      * @param string                $url     Absolute URL (or a path relative to API_BASE).
@@ -1081,7 +1116,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *
      * @return array{status:int, body:string}
      *
-     * @throws OpenSubtitlesException On transport/network failure.
+     * @throws OpenSubtitlesException On transport/network failure or an over-cap response.
      */
     private function httpRequest(string $method, string $url, array $headers = [], ?string $body = null): array
     {
@@ -1092,14 +1127,27 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $headers = array_merge($this->defaultHeaders(), $headers);
 
         if ($this->transport !== null) {
-            return ($this->transport)($method, $url, $headers, $body);
+            return self::assertWithinResponseCap(($this->transport)($method, $url, $headers, $body));
         }
 
         $state = ['status' => 0, 'body' => '', 'error' => null, 'done' => false];
 
+        // Running total of streamed response bytes (the client emits each
+        // body chunk through `progress` before writing it to its buffer).
+        $receivedBytes = 0;
+
         $options = [
             'method' => $method,
             'headers' => $headers,
+            // Abort mid-flight once the cap is crossed: throwing here rides
+            // the client's error path, which closes the connection and
+            // records $state['error'] — an over-cap body is never delivered.
+            'progress' => function (string $chunk) use (&$receivedBytes): void {
+                $receivedBytes += strlen($chunk);
+                if ($receivedBytes > self::MAX_RESPONSE_BYTES) {
+                    throw new OpenSubtitlesException(self::responseCapExceededMessage());
+                }
+            },
             'success' => function (Response $response) use (&$state): void {
                 $state['status'] = $response->getStatusCode();
                 $state['body'] = $response->getBody()->getContents();
@@ -1138,7 +1186,44 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             throw new OpenSubtitlesException('HTTP request timed out after ' . self::HTTP_TIMEOUT_SEC . 's');
         }
 
-        return ['status' => $state['status'], 'body' => $state['body']];
+        // Authoritative single choke point: covers the real transport result
+        // exactly as it covers the seam above.
+        return self::assertWithinResponseCap(['status' => $state['status'], 'body' => $state['body']]);
+    }
+
+    /**
+     * The canonical over-cap failure message.
+     *
+     * @return string
+     *
+     * @since 0.6.1
+     */
+    private static function responseCapExceededMessage(): string
+    {
+        return 'HTTP response exceeded the ' . self::MAX_RESPONSE_BYTES . '-byte cap';
+    }
+
+    /**
+     * Guard a response envelope against {@see MAX_RESPONSE_BYTES}.
+     *
+     * Early-exit on the healthy path; an over-cap body never reaches a caller
+     * as a return value (fail loud, never partial or empty "success").
+     *
+     * @param array{status:int, body:string} $response
+     *
+     * @return array{status:int, body:string} The unchanged response.
+     *
+     * @throws OpenSubtitlesException When the body exceeds the cap.
+     *
+     * @since 0.6.1
+     */
+    private static function assertWithinResponseCap(array $response): array
+    {
+        if (strlen($response['body']) <= self::MAX_RESPONSE_BYTES) {
+            return $response;
+        }
+
+        throw new OpenSubtitlesException(self::responseCapExceededMessage());
     }
 
     /**

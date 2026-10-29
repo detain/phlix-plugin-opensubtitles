@@ -21,7 +21,10 @@ final class SubtitleDownload
 {
     /**
      * @param string      $content            Raw subtitle file content (fetched from the
-     *        temporary `link` returned by the OpenSubtitles `/download` endpoint).
+     *        temporary `link` returned by the OpenSubtitles `/download` endpoint). Raw
+     *        provider bytes: this DTO makes no encoding claim — the UTF-8 validation
+     *        behind {@see \Phlix\Shared\Subtitle\SubtitleFile::$encoding} happens in
+     *        {@see OpenSubtitlesProvider::download()}.
      * @param string      $format             Subtitle format (srt, sub, ass, etc.).
      * @param string      $fileName           Original filename from the provider.
      * @param int|null    $requestsUsed       Download requests counted so far in the current

@@ -928,6 +928,143 @@ final class OpenSubtitlesProviderTest extends TestCase
     }
 
     // ---------------------------------------------------------------------
+    // Response size cap (review opensubtitles__srphp C1 — memory DoS)
+    // ---------------------------------------------------------------------
+
+    /**
+     * The provider's private response-cap constant, read via reflection so
+     * these tests track the real limit instead of duplicating a literal.
+     */
+    private function responseCap(): int
+    {
+        $cap = (new \ReflectionClass(OpenSubtitlesProvider::class))->getConstant('MAX_RESPONSE_BYTES');
+        $this->assertIsInt($cap, 'MAX_RESPONSE_BYTES must be declared as an int');
+        $this->assertGreaterThan(0, $cap);
+
+        return $cap;
+    }
+
+    /**
+     * A valid step-1 `POST download` link envelope (second response varies).
+     *
+     * @return array{status:int, body:string}
+     */
+    private function linkResponse(): array
+    {
+        return self::response(200, (string) json_encode([
+            'link' => 'https://dl.opensubtitles.org/download/src/upload/12345.srt',
+            'file_name' => 'movie.srt',
+        ]));
+    }
+
+    public function test_download_content_response_over_cap_fails_loud_instead_of_collapsing(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            $this->linkResponse(),
+            self::response(200, str_repeat('a', $this->responseCap() + 1)),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        // Over-cap must surface the documented HTTP-failure envelope wrapped
+        // as 'Download failed: ...' — never a partial success, never [].
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessageMatches('/Download failed: HTTP response exceeded the \d+-byte cap/');
+        $provider->downloadRaw(998877);
+    }
+
+    public function test_download_content_response_exactly_at_cap_is_accepted(): void
+    {
+        $cap = $this->responseCap();
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $body = str_repeat('a', $cap);
+        $this->installFakeTransport($provider, [
+            $this->linkResponse(),
+            self::response(200, $body),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $download = $provider->downloadRaw(998877);
+
+        $this->assertSame($cap, strlen($download->content));
+        $this->assertSame($body, $download->content);
+    }
+
+    public function test_search_response_over_cap_throws_on_the_same_sink(): void
+    {
+        // The cap lives in httpRequest(), so every response — the login/token
+        // path included — passes the same choke point, not just downloads.
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, str_repeat('x', $this->responseCap() + 1)),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessageMatches('/Search by IMDB ID failed: HTTP response exceeded the \d+-byte cap/');
+        $provider->searchByImdbIdRaw('tt1234567');
+    }
+
+    public function test_content_fetch_declares_identity_accept_encoding(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            $this->linkResponse(),
+            self::response(200, "1\n00:00:01,000 --> 00:00:02,000\nHi.\n"),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $provider->downloadRaw(998877);
+
+        $this->assertSame('identity', $history[1]['headers']['Accept-Encoding']);
+    }
+
+    // ---------------------------------------------------------------------
+    // UTF-8 honesty (review opensubtitles__srphp C1 — garbage-as-SRT poisoning)
+    // ---------------------------------------------------------------------
+
+    public function test_download_fails_loud_when_content_is_not_valid_utf8(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            $this->linkResponse(),
+            // gzip magic + invalid continuation bytes: the shape of a
+            // mis-uploaded or compressed binary body masquerading as SRT.
+            self::response(200, "\x1f\x8b\x08\x00\x00\x00\x00\x00\xff\xfe binary garbage\x00"),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessageMatches('/not valid UTF-8/');
+        $provider->download(self::candidate('998877', 'en', 'srt', 'rel'));
+    }
+
+    public function test_download_accepts_valid_multibyte_utf8_content(): void
+    {
+        $content = "1\n00:00:01,000 --> 00:00:02,000\nПривет — ünïcödé 日本語 ✓\n";
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY, format: 'srt');
+        $history = [];
+        $this->installFakeTransport($provider, [
+            $this->linkResponse(),
+            self::response(200, $content),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $file = $provider->download(self::candidate('998877', 'en', 'srt', 'rel'));
+
+        $this->assertSame($content, $file->content);
+        $this->assertSame('UTF-8', $file->encoding);
+    }
+
+    // ---------------------------------------------------------------------
     // Shared SubtitleSourceInterface contract (Wave 3 F3)
     // ---------------------------------------------------------------------
 
