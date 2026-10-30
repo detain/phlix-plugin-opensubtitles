@@ -61,7 +61,10 @@ The plugin implements the `Phlix\Shared\Plugin\LifecycleInterface`, `Phlix\Share
    `api_key` alone — lower download limits, full search. The REST v1 API has
    **no user-agent registration endpoint**; see “User-Agent & OpenSubtitles
    ToS” below for what actually satisfies the terms.
-2. **Search** — queries subtitles by IMDB ID, filename, or `moviehash`.
+2. **Search** — queries subtitles by IMDB ID, filename, or `moviehash`. Each
+   query returns the API **first page only** — result counts reflect that page,
+   and the reported `meta.total_pages` is deliberately not followed; narrow the
+   query instead of paging.
 3. **Download — two steps** — `POST /download` with the file id consumes ONE
    quota unit and returns a temporary HTTPS link plus quota accounting; the
    plugin then fetches that link with a plain, **credential-free HTTPS GET**

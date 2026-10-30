@@ -763,7 +763,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *                                (mapped to the OpenSubtitles language
      *                                domain; empty = no filter).
      *
-     * @return list<SubtitleCandidate> Candidates, best-match first.
+     * @return list<SubtitleCandidate> Candidates, best-match first (API first
+     *                                  page only — see the searchSubtitles()
+     *                                  pagination law).
      *
      * @throws OpenSubtitlesException When the search transport/HTTP fails.
      *
@@ -812,7 +814,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *                                (mapped to the OpenSubtitles language
      *                                domain; empty = no filter).
      *
-     * @return list<SubtitleCandidate> Candidates, best-match first.
+     * @return list<SubtitleCandidate> Candidates, best-match first (API first
+     *                                  page only — see the searchSubtitles()
+     *                                  pagination law).
      *
      * @throws OpenSubtitlesException When the search transport/HTTP fails.
      *
@@ -843,7 +847,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *                                (mapped to the OpenSubtitles language
      *                                domain; empty = no filter).
      *
-     * @return list<SubtitleCandidate> Candidates, best-match first.
+     * @return list<SubtitleCandidate> Candidates, best-match first (API first
+     *                                  page only — see the searchSubtitles()
+     *                                  pagination law).
      *
      * @throws OpenSubtitlesException When the search transport/HTTP fails.
      *
@@ -952,6 +958,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
      * }>
      *
+     * Results carry the API first page only (see the searchSubtitles() pagination law).
+     *
      * @throws OpenSubtitlesException When the search fails.
      *
      * @since 0.1.0
@@ -999,6 +1007,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
      * }>
      *
+     * Results carry the API first page only (see the searchSubtitles() pagination law).
+     *
      * @throws OpenSubtitlesException When the search fails.
      *
      * @since 0.4.0
@@ -1041,6 +1051,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *     fps: ?float,
      *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
      * }>
+     *
+     * Results carry the API first page only (see the searchSubtitles() pagination law).
      *
      * @throws OpenSubtitlesException When the search fails.
      *
@@ -1116,6 +1128,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
      * }>
      *
+     * Results carry the API first page only (see the searchSubtitles() pagination law).
+     *
      * @throws OpenSubtitlesException When the search fails.
      *
      * @since 0.1.0
@@ -1159,6 +1173,14 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *     fps: ?float,
      *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
      * }>
+     *
+     * Pagination law: this issues exactly ONE API request and returns its
+     * first page. The REST v1 envelope reports `meta.total_pages`, but pages
+     * are deliberately never followed: walking pagination would multiply the
+     * API calls per search against a rate-limited gateway, while the
+     * language/format filters already narrow the set and every caller ranks
+     * within the returned page. A caller that needs deeper results must
+     * re-query with a narrower filter, not expect exhaustion of the catalog.
      *
      * @throws OpenSubtitlesException When the search fails — including a 2xx
      *         response whose body is not valid JSON or lacks the expected
