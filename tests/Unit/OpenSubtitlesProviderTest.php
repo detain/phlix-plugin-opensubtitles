@@ -3182,7 +3182,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertStringStartsWith('https://api.opensubtitles.com/api/v1/', $history[0]['url']);
     }
 
-    public function test_download_maps_500_error_to_quota_when_message_looks_like_quota(): void
+    public function test_download_maps_429_error_to_quota_when_message_looks_like_quota(): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
         $history = [];
@@ -3196,6 +3196,31 @@ final class OpenSubtitlesProviderTest extends TestCase
 
         $this->expectException(OpenSubtitlesQuotaExceededException::class);
         $provider->downloadRaw(998877);
+    }
+
+    public function test_download_maps_500_error_to_generic_failure_even_when_message_looks_like_quota(): void
+    {
+        // A server-side 5xx is NOT a quota verdict even if its message body
+        // happens to carry quota wording — only sub-500 statuses may map to
+        // the quota exception (see the guard in mapDownloadLinkFailure()).
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(500, (string) json_encode([
+                'message' => 'You have downloaded your allowed 20 subtitles for 24h. Quota will be renewed automatically.',
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->downloadRaw(998877);
+            $this->fail('Expected a mapped download failure for the 500 response.');
+        } catch (OpenSubtitlesQuotaExceededException $quota) {
+            $this->fail('A 5xx with quota-looking wording must not map to the quota exception.');
+        } catch (OpenSubtitlesException $failure) {
+            $this->assertStringContainsString('Download failed:', $failure->getMessage());
+        }
     }
 
     public function test_safe_filename_strips_directory_components(): void
