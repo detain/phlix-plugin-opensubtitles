@@ -12,18 +12,14 @@ declare(strict_types=1);
 /**
  * Test bootstrap for the plugin's own PHPUnit suite.
  *
- * The plugin's runtime dependency is the Phlix server, which provides
- * `Phlix\Shared\Plugin\LifecycleInterface`. In an installed plugin
- * (`var/plugins/phlix-plugin-opensubtitles/`) that interface is resolved by
- * the host application's autoloader. When the plugin is tested in
- * isolation — `composer install && vendor/bin/phpunit` from this
- * repo — the host isn't on the classpath, so we declare a minimal stub
- * here that matches the published shape.
- *
- * The stub is only registered when the real interface is absent, so
- * downstream integration tests (e.g. the server-side
- * `SamplePluginSmokeTest` in `detain/phlix`) still resolve the real
- * contract.
+ * The class `Phlix\Shared\Plugin\LifecycleInterface` this plugin implements
+ * normally comes from the pinned `detain/phlix-shared` composer dependency
+ * and is autoloaded by `vendor/autoload.php` below. As a defensive
+ * fallback, `dev-stubs/LifecycleInterface.php` declares a minimal
+ * same-shape stub, but ONLY when the real contract is absent from the
+ * classpath (e.g. a vendor tree built without phlix-shared): the
+ * `interface_exists()` guard runs first, so whenever the real interface
+ * is autoloadable it wins and the stub file is never read.
  */
 
 require __DIR__ . '/../vendor/autoload.php';
