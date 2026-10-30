@@ -106,6 +106,26 @@ and contact route before publishing.**
 API references: [REST API docs](https://www.opensubtitles.com/en/doc/apis) ·
 [consumer (API application) portal](https://www.opensubtitles.com/en/consumers).
 
+## Development
+
+Setup (PHP >= 8.3). `composer.lock` is committed on purpose — CI audits
+exactly those pinned versions (the S440 security-audit gate reads the
+tracked lock), so install from it rather than re-resolving:
+
+    composer install
+
+Local gates (the same commands `.github/workflows/test.yml` runs):
+
+    vendor/bin/phpunit                           # hermetic unit suite (fake transport, no network)
+    vendor/bin/phpstan analyse src --level=9     # or: composer phpstan
+    vendor/bin/phpcs src --standard=PSR12        # or: composer phpcs
+
+There is deliberately no `composer test` script; run `vendor/bin/phpunit`
+directly. PSR-12 is gated on `src/` only: `tests/` follows the repo's
+snake_case test-method convention, which the raw PSR-12 sniff reports on
+(a pre-existing backlog) — keep new test code consistent with its
+neighbors rather than re-casing it.
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
