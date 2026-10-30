@@ -59,7 +59,16 @@ use Workerman\Http\Response;
  *
  * OpenSubtitles enforces a per-account daily download quota, so fetches are
  * strictly on-demand — this plugin never bulk-downloads or loops over results.
- * Quota exhaustion is surfaced as {@see OpenSubtitlesQuotaExceededException}.
+ * Quota exhaustion surfaces at two distinct boundaries: the raw public API
+ * ({@see downloadRaw()}) throws {@see OpenSubtitlesQuotaExceededException},
+ * while the shared-contract entry {@see download()} translates it to
+ * {@see \Phlix\Shared\Subtitle\Exception\QuotaExceeded} (which extends
+ * `RuntimeException`, NOT `OpenSubtitlesException`) carrying the remaining
+ * allowance and reset time — pipeline callers catch the shared type. Once an
+ * exhausted window has been reported by the API with a concrete future
+ * reset, further raw/contract downloads fail fast locally with the same
+ * boundary types until that instant — no network re-dial into a window the
+ * vendor declared dead.
  *
  * ## Dispatch
  *

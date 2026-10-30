@@ -54,7 +54,18 @@ The plugin implements the `Phlix\Shared\Plugin\LifecycleInterface`, `Phlix\Share
 2. **Search** — queries subtitles by IMDB ID, filename, or `moviehash`
 3. **Download** — fetches the subtitle file and feeds it into Phlix's subtitle pipeline
 
-When the account's download quota is exhausted, `download()` throws `OpenSubtitlesQuotaExceededException` (a subclass of `OpenSubtitlesException`) so callers can stop retrying or fall back to another provider.
+When the account's download quota is exhausted, the shared-contract entry
+point `download()` throws `Phlix\Shared\Subtitle\Exception\QuotaExceeded` —
+carrying the remaining allowance and the reset time — so callers can stop
+retrying or fall back to another provider. `QuotaExceeded` extends
+`RuntimeException`, NOT `OpenSubtitlesException`; catching the plugin's own
+exception base around `download()` would miss it. The low-level `downloadRaw()`
+signals the same condition as `OpenSubtitlesQuotaExceededException` (a subclass
+of `OpenSubtitlesException`) — the type `download()` translates from. Once the
+API reports an exhausted window (`remaining: 0` with a future
+`reset_time_utc`), further downloads are refused locally with the same
+boundary types until that reset — the plugin never re-dials a window the
+vendor declared dead.
 
 ## API
 

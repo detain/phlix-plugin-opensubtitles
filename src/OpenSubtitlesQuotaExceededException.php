@@ -12,8 +12,17 @@ declare(strict_types=1);
 namespace Phlix\PluginOpenSubtitles;
 
 /**
- * Thrown when {@see OpenSubtitlesProvider::download()} cannot complete because
- * the account's OpenSubtitles download quota has been exhausted.
+ * Thrown when the account's OpenSubtitles download quota has been exhausted —
+ * either reported by the API or remembered from a window it already declared
+ * dead (local fail-fast).
+ *
+ * This is the boundary of the plugin's RAW public API:
+ * {@see OpenSubtitlesProvider::downloadRaw()} throws it, and direct raw-API
+ * callers catch it. Through the shared subtitle contract,
+ * {@see OpenSubtitlesProvider::download()} TRANSLATES it to
+ * {@see \Phlix\Shared\Subtitle\Exception\QuotaExceeded}, so catching THIS
+ * type around download() is dead code — pipeline callers must catch the
+ * shared type.
  *
  * A caller (e.g. a subtitle-fetch orchestrator that tries several files or
  * falls back to another provider) can catch this specifically rather than a
