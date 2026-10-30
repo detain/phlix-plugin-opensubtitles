@@ -3648,4 +3648,73 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertSame(100, $result[1]['downloads']);
         $this->assertSame(10, $result[2]['downloads']);
     }
+
+    public function test_filter_subtitles_resolves_ties_by_rating_then_file_id_deterministically(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'filterSubtitles');
+        $method->setAccessible(true);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $row = static function (string $id, int $fileId, ?float $rating): array {
+            return [
+                'id' => $id,
+                'attributes' => [
+                    'language' => 'en',
+                    'download_count' => 500,
+                    'ratings' => $rating,
+                    'files' => [['file_id' => $fileId, 'file_name' => $id . '.srt', 'cd_number' => 1]],
+                ],
+            ];
+        };
+
+        // Same download count everywhere: rating decides first, unrated goes
+        // last, and equal-rating rows fall back to file_id ascending.
+        $raw = [
+            $row('c', 30, 7.0),
+            $row('a', 10, 9.0),
+            $row('d', 20, null),
+            $row('b', 11, 9.0),
+        ];
+
+        $expected = ['a', 'b', 'c', 'd'];
+        foreach ([$expected, array_reverse($raw)] as $pass => $_) {
+            $input = $pass === 0 ? $raw : array_reverse($raw);
+            $result = $method->invoke($provider, $input, 'srt');
+            $this->assertSame(
+                $expected,
+                array_column($result, 'id'),
+                'Tie order must be a total order — independent of input permutation.'
+            );
+        }
+    }
+
+    public function test_debug_info_redacts_credentials_and_keeps_benign_state_visible(): void
+    {
+        $provider = new OpenSubtitlesProvider(
+            apiKey: self::TEST_API_KEY,
+            username: 'subscriber-name',
+            password: 'subscriber-password',
+        );
+
+        // Simulate a live session without touching the network.
+        $token = new \ReflectionProperty(OpenSubtitlesProvider::class, 'sessionToken');
+        $token->setAccessible(true);
+        $token->setValue($provider, 'live-session-token');
+
+        $clients = new \ReflectionProperty(OpenSubtitlesProvider::class, 'httpClients');
+        $clients->setAccessible(true);
+        $clients->setValue($provider, ['api.opensubtitles.com' => ['Authorization' => 'Bearer live-session-token']]);
+
+        $visible = $provider->__debugInfo();
+
+        foreach (['apiKey', 'username', 'password', 'sessionToken', 'httpClients'] as $secret) {
+            $this->assertSame('[redacted]', $visible[$secret], $secret . ' must not surface through debug printing.');
+        }
+
+        $this->assertSame('en', $visible['language']);
+        $this->assertStringNotContainsString('live-session-token', var_export($visible, true));
+        $this->assertStringNotContainsString('subscriber-password', var_export($visible, true));
+        $this->assertStringNotContainsString(self::TEST_API_KEY, var_export($visible, true));
+    }
 }

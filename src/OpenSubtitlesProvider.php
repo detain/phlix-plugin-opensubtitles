@@ -2043,8 +2043,23 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             ];
         }
 
-        // Sort by download count descending
-        usort($results, static fn (array $a, array $b): int => $b['downloads'] <=> $a['downloads']);
+        // Total order: download count descending, then rating descending
+        // (unrated last), then file_id ascending — so equal-download rows keep
+        // the same sequence across runs and PHP versions instead of inheriting
+        // usort's unstable tie order.
+        usort($results, static function (array $a, array $b): int {
+            $byDownloads = $b['downloads'] <=> $a['downloads'];
+            if ($byDownloads !== 0) {
+                return $byDownloads;
+            }
+
+            $byRating = ($b['rating'] ?? -1.0) <=> ($a['rating'] ?? -1.0);
+            if ($byRating !== 0) {
+                return $byRating;
+            }
+
+            return (string) $a['file_id'] <=> (string) $b['file_id'];
+        });
 
         return $results;
     }
@@ -2414,5 +2429,29 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     public function getFormat(): string
     {
         return $this->format;
+    }
+
+    /**
+     * Redact credentials from var_dump()-style output.
+     *
+     * PHP hands debug printing to this hook instead of exposing private
+     * state: the consumer key, username, password, session token and the
+     * cached per-host HTTP clients (their option arrays carry the auth
+     * headers) collapse to a placeholder; non-sensitive configuration
+     * stays visible. Guards against a stray var_dump of the provider (or a
+     * debug_backtrace in an exception) leaking live credentials into logs.
+     *
+     * @return array<string, mixed>
+     *
+     * @since 0.6.0
+     */
+    public function __debugInfo(): array
+    {
+        $visible = get_object_vars($this);
+        foreach (['apiKey', 'username', 'password', 'sessionToken', 'httpClients'] as $secret) {
+            $visible[$secret] = '[redacted]';
+        }
+
+        return $visible;
     }
 }
