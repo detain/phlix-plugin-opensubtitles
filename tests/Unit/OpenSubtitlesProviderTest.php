@@ -332,10 +332,16 @@ final class OpenSubtitlesProviderTest extends TestCase
         $provider->searchByImdbIdRaw('tt1234567');
 
         $this->assertSame(
-            'Phlix-Plugin-OpenSubtitles/' . $expectedVersion,
+            'Phlix-Plugin-OpenSubtitles/' . $expectedVersion . ' (+https://github.com/detain/phlix-plugin-opensubtitles)',
             $history[0]['headers']['User-Agent'],
         );
         $this->assertNotSame('Phlix-Plugin-OpenSubtitles/0.1.0', $history[0]['headers']['User-Agent']);
+        // ToS contact identity (review osst__secaudit M08): the UA must carry a
+        // contact route so the vendor can reach the integrator before banning.
+        $this->assertStringContainsString(
+            '(+https://github.com/detain/phlix-plugin-opensubtitles)',
+            $history[0]['headers']['User-Agent'],
+        );
         $this->assertSame(self::TEST_API_KEY, $history[0]['headers']['Api-Key']);
     }
 

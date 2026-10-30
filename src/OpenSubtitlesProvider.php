@@ -150,6 +150,19 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     private const HASH_CHUNK_SIZE = 65536;
 
     /**
+     * Contact identity appended to the outgoing User-Agent.
+     *
+     * OpenSubtitles' API terms require a descriptive User-Agent that carries a
+     * contact route for third-party integrations; non-descriptive or
+     * contact-less agents are rate-limited and can get the consumer key — and
+     * with it every Phlix instance sharing the build — banned. The project
+     * repository (issue tracker reachable by the vendor) is the stable
+     * contact route; forks and derivatives MUST replace it with their own
+     * (see the README "User-Agent & ToS" section).
+     */
+    private const USER_AGENT_CONTACT_URL = 'https://github.com/detain/phlix-plugin-opensubtitles';
+
+    /**
      * OpenSubtitles API key (consumer token).
      */
     private string $apiKey;
@@ -1275,13 +1288,18 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     /**
      * Default headers sent on every request.
      *
+     * The User-Agent carries the contact identity OpenSubtitles' ToS demands
+     * ({@see USER_AGENT_CONTACT_URL}) and rides every request, including the
+     * download-link fetch on the link host.
+     *
      * @return array<string, string>
      */
     private function defaultHeaders(): array
     {
         return [
             'Api-Key' => $this->apiKey,
-            'User-Agent' => 'Phlix-Plugin-OpenSubtitles/' . self::pluginVersion(),
+            'User-Agent' => 'Phlix-Plugin-OpenSubtitles/' . self::pluginVersion()
+                . ' (+' . self::USER_AGENT_CONTACT_URL . ')',
             'Accept' => 'application/json',
         ];
     }
