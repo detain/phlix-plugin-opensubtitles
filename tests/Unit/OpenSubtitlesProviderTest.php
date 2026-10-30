@@ -227,6 +227,71 @@ final class OpenSubtitlesProviderTest extends TestCase
     }
 
     // ---------------------------------------------------------------------
+    // Credential scoping (review osst__secaudit M05): the consumer key must
+    // never ride to a response-supplied link host, and links must be HTTPS.
+    // ---------------------------------------------------------------------
+
+    public function test_link_fetch_carries_user_agent_but_no_consumer_credentials(): void
+    {
+        $provider = new OpenSubtitlesProvider(
+            apiKey: self::TEST_API_KEY,
+            username: 'u',
+            password: 'p',
+        );
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode(['token' => 'tok'])),
+            self::response(200, (string) json_encode([
+                'link' => 'https://dl.example-cdn.org/download/src/upload/9.srt',
+                'file_name' => '9.srt',
+                'remaining' => 5,
+            ])),
+            self::response(200, "1\n00:00:01,000 --> 00:00:02,000\nHello\n"),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $provider->downloadRaw(9);
+
+        $this->assertCount(3, $history);
+        // Step-1 went to the API origin with the key.
+        $this->assertSame(self::TEST_API_KEY, $history[1]['headers']['Api-Key']);
+        // Step-2 goes to a foreign, response-supplied host: identity only.
+        $linkHeaders = $history[2]['headers'];
+        $this->assertArrayNotHasKey('Api-Key', $linkHeaders, 'consumer key must not leave the API origin');
+        $this->assertArrayNotHasKey('Authorization', $linkHeaders);
+        $this->assertArrayNotHasKey('Accept', $linkHeaders, 'JSON content-negotiation is API-only');
+        $this->assertArrayHasKey('User-Agent', $linkHeaders, 'the ToS-required UA rides every request');
+        $this->assertSame('identity', $linkHeaders['Accept-Encoding']);
+    }
+
+    public function test_non_https_download_link_is_refused_without_dialing(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'link' => 'http://dl.opensubtitles.org/download/src/upload/12345.srt',
+                'file_name' => '12345.srt',
+                'remaining' => 4,
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->downloadRaw(12345);
+            $this->fail('Expected OpenSubtitlesException for a plain-http link.');
+        } catch (OpenSubtitlesException $e) {
+            $this->assertStringContainsString('HTTPS', $e->getMessage());
+        }
+
+        // Refused before the dial: the only recorded request is step-1.
+        $this->assertCount(1, $history);
+    }
+
+    // ---------------------------------------------------------------------
     // Strict TLS verification (review osst__secaudit M03): per-host clients
     // with an explicit verify_peer / verify_peer_name / SNI context.
     // ---------------------------------------------------------------------

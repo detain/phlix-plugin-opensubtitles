@@ -985,7 +985,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *    call itself counts against the account's download quota, so it must
      *    never be retried speculatively or looped.
      * 2. The actual subtitle bytes are fetched with a plain `GET` against that
-     *    `link` (a different host, not `API_BASE`).
+     *    `link` (a different host, not `API_BASE`). The link must be HTTPS and
+     *    is fetched WITHOUT the consumer credentials — the API origin is the
+     *    only host that ever sees the `Api-Key` or the session token.
      *
      * Quota exhaustion is surfaced distinctly as
      * {@see OpenSubtitlesQuotaExceededException} — either from a 4xx `message`
@@ -1051,6 +1053,17 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $fileName = is_string($data['file_name'] ?? null)
             ? $data['file_name']
             : "subtitle.{$this->format}";
+
+        // The link is a raw, response-supplied URL to a foreign host. Refuse
+        // to fetch it in the clear, and never send consumer credentials
+        // cross-origin ({@see foreignOriginHeaders()}).
+        if (!str_starts_with($link, 'https://')) {
+            $this->logger->error('OpenSubtitles download link rejected: not an HTTPS URL');
+
+            throw new OpenSubtitlesException(
+                'OpenSubtitles download link is not an HTTPS URL; refusing an in-the-clear fetch',
+            );
+        }
 
         try {
             // Make the wire contract explicit: this plugin does not decode
@@ -1183,7 +1196,10 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             $url = self::API_BASE . ltrim($url, '/');
         }
 
-        $headers = array_merge($this->defaultHeaders(), $headers);
+        $headers = array_merge(
+            self::isApiOrigin($url) ? $this->defaultHeaders() : $this->foreignOriginHeaders(),
+            $headers,
+        );
 
         if ($this->transport !== null) {
             return self::assertWithinResponseCap(($this->transport)($method, $url, $headers, $body));
@@ -1286,11 +1302,32 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     }
 
     /**
-     * Default headers sent on every request.
-     *
-     * The User-Agent carries the contact identity OpenSubtitles' ToS demands
-     * ({@see USER_AGENT_CONTACT_URL}) and rides every request, including the
-     * download-link fetch on the link host.
+     * True when `$url`'s host is the OpenSubtitles API origin — the only host
+     * allowed to see the consumer `Api-Key` and the session token
+     * ({@see defaultHeaders()}). Download links point at a different,
+     * response-supplied host; they get identity ({@see foreignOriginHeaders()})
+     * but never credentials — closing the credential-exfiltration-by-response
+     * vector where a single malformed or malicious link value would otherwise
+     * ship the long-lived consumer key cross-origin.
+     */
+    private static function isApiOrigin(string $url): bool
+    {
+        return parse_url($url, PHP_URL_HOST) === self::API_HOST;
+    }
+
+    /**
+     * The descriptive, contact-bearing User-Agent required by OpenSubtitles'
+     * ToS. It is identification, not a credential, so it rides EVERY request,
+     * API origin and foreign hosts alike (see {@see USER_AGENT_CONTACT_URL}).
+     */
+    private static function userAgent(): string
+    {
+        return 'Phlix-Plugin-OpenSubtitles/' . self::pluginVersion()
+            . ' (+' . self::USER_AGENT_CONTACT_URL . ')';
+    }
+
+    /**
+     * Headers sent on requests to the API origin ({@see isApiOrigin()}).
      *
      * @return array<string, string>
      */
@@ -1298,9 +1335,22 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     {
         return [
             'Api-Key' => $this->apiKey,
-            'User-Agent' => 'Phlix-Plugin-OpenSubtitles/' . self::pluginVersion()
-                . ' (+' . self::USER_AGENT_CONTACT_URL . ')',
+            'User-Agent' => self::userAgent(),
             'Accept' => 'application/json',
+        ];
+    }
+
+    /**
+     * Headers sent to any host OTHER than the API origin (the step-2
+     * download-link fetch). Deliberately credential-free: the consumer key
+     * and session token belong to {@see API_HOST} alone.
+     *
+     * @return array<string, string>
+     */
+    private function foreignOriginHeaders(): array
+    {
+        return [
+            'User-Agent' => self::userAgent(),
         ];
     }
 
