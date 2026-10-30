@@ -227,6 +227,226 @@ final class OpenSubtitlesProviderTest extends TestCase
     }
 
     // ---------------------------------------------------------------------
+    // Session-token lifecycle (review osst__secaudit M04, osst__srphp M2/M3):
+    // the Bearer token must be asserted on the wire, its expires_in deadline
+    // honored, an HTTP 401 on an authenticated call must trigger exactly one
+    // forced re-auth + retry, and only CONFIRMED credential rejection may
+    // stay latched for the whole cycle (transient failures retry, throttled
+    // to one login per business call).
+    // ---------------------------------------------------------------------
+
+    /**
+     * A provider with full credentials (API key + username + password).
+     */
+    private function providerWithCredentials(): OpenSubtitlesProvider
+    {
+        return new OpenSubtitlesProvider(
+            apiKey: self::TEST_API_KEY,
+            username: 'u',
+            password: 'p',
+        );
+    }
+
+    /**
+     * The session token must actually ride authenticated API calls as an
+     * `Authorization: Bearer` header — the suite previously asserted request
+     * counts but never the auth header itself.
+     */
+    public function test_bearer_session_token_rides_search_and_download_legs(): void
+    {
+        $provider = $this->providerWithCredentials();
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode(['token' => 'session-token-123'])),
+            self::response(200, '{"data":[]}'),
+            self::response(200, (string) json_encode([
+                'link' => 'https://dl.example-cdn.org/f.srt',
+                'remaining' => 5,
+            ])),
+            self::response(200, "1\n00:00:01,000 --> 00:00:02,000\nhi\n"),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $provider->searchByImdbIdRaw('tt1');
+        $provider->downloadRaw(42);
+
+        $this->assertSame('Bearer session-token-123', $history[1]['headers']['Authorization'] ?? null);
+        $this->assertSame('Bearer session-token-123', $history[2]['headers']['Authorization'] ?? null);
+    }
+
+    /**
+     * A login response advertising `expires_in` shorter than the call gap must
+     * refresh the token on the next use rather than keep sending a dead one.
+     */
+    public function test_expired_session_token_is_refreshed_on_next_call(): void
+    {
+        $provider = $this->providerWithCredentials();
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, '{"token":"tok-a","expires_in":0}'),
+            self::response(200, '{"data":[]}'),
+            self::response(200, '{"token":"tok-b"}'),
+            self::response(200, '{"data":[]}'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $provider->searchByImdbIdRaw('tt1');
+        $this->assertTrue($provider->isLoggedIn());
+
+        $provider->searchByImdbIdRaw('tt2');
+        $this->assertTrue($provider->isLoggedIn());
+
+        $loginCalls = array_filter($history, static fn (array $h): bool => str_ends_with($h['url'], '/login'));
+        $this->assertCount(2, $loginCalls, 'an expired token must force exactly one fresh login');
+        $this->assertSame('Bearer tok-b', $history[3]['headers']['Authorization'] ?? null);
+    }
+
+    /**
+     * A 401 mid-session (token invalidated server-side) must invalidate,
+     * re-login once, and retry the search transparently.
+     */
+    public function test_search_401_triggers_one_reauth_and_retry(): void
+    {
+        $provider = $this->providerWithCredentials();
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, '{"token":"tok-a"}'),
+            self::response(401, '{"message":"session revoked"}'),
+            self::response(200, '{"token":"tok-b"}'),
+            self::response(200, '{"data":[]}'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $results = $provider->searchByImdbIdRaw('tt1');
+
+        $this->assertSame([], $results, 'the retry must complete transparently');
+        $this->assertCount(4, $history);
+        $loginCalls = array_filter($history, static fn (array $h): bool => str_ends_with($h['url'], '/login'));
+        $this->assertCount(2, $loginCalls);
+        $this->assertSame('Bearer tok-b', $history[3]['headers']['Authorization'] ?? null);
+    }
+
+    /**
+     * The re-auth retry budget is exactly one: a second consecutive 401 fails
+     * loud instead of looping.
+     */
+    public function test_search_401_retry_is_spent_and_second_401_throws(): void
+    {
+        $provider = $this->providerWithCredentials();
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, '{"token":"tok-a"}'),
+            self::response(401, '{"message":"session revoked"}'),
+            self::response(200, '{"token":"tok-b"}'),
+            self::response(401, '{"message":"still rejected"}'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->searchByImdbIdRaw('tt1');
+            $this->fail('Expected OpenSubtitlesException after the spent retry budget.');
+        } catch (OpenSubtitlesException $e) {
+            $this->assertStringContainsString('failed: HTTP 401', $e->getMessage());
+        }
+
+        $loginCalls = array_filter($history, static fn (array $h): bool => str_ends_with($h['url'], '/login'));
+        $this->assertCount(2, $loginCalls, 'no third login attempt past the retry budget');
+    }
+
+    /**
+     * Same once-budget for the quota-consuming download step-1 POST: 401 →
+     * re-login → exactly one re-issue, then the link leg proceeds.
+     */
+    public function test_download_step_one_401_retries_once_after_relogin(): void
+    {
+        $provider = $this->providerWithCredentials();
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, '{"token":"tok-a"}'),
+            self::response(401, '{"message":"session revoked"}'),
+            self::response(200, '{"token":"tok-b"}'),
+            self::response(200, (string) json_encode([
+                'link' => 'https://dl.example-cdn.org/f.srt',
+                'remaining' => 5,
+                'file_name' => 'movie.srt',
+            ])),
+            self::response(200, "1\n00:00:01,000 --> 00:00:02,000\nhi\n"),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $download = $provider->downloadRaw(42);
+
+        $this->assertCount(5, $history);
+        $loginCalls = array_filter($history, static fn (array $h): bool => str_ends_with($h['url'], '/login'));
+        $this->assertCount(2, $loginCalls);
+        $downloadCalls = array_filter(
+            $history,
+            static fn (array $h): bool => str_ends_with($h['url'], '/download'),
+        );
+        $this->assertCount(2, $downloadCalls, 'step-1 is re-issued at most once after re-auth');
+        $this->assertSame('Bearer tok-b', array_values($downloadCalls)[1]['headers']['Authorization'] ?? null);
+        $this->assertSame('movie.srt', $download->fileName);
+    }
+
+    /**
+     * A transient login failure (5xx / transport throw) must NOT stay latched
+     * for the whole enable cycle — the next call gets one retry.
+     */
+    public function test_transient_login_failure_is_retried_on_next_call(): void
+    {
+        $provider = $this->providerWithCredentials();
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(500, '{"message":"upstream hiccup"}'),
+            self::response(200, '{"data":[]}'),
+            self::response(200, '{"token":"tok-b"}'),
+            self::response(200, '{"data":[]}'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $provider->searchByImdbIdRaw('tt1');
+        $this->assertFalse($provider->isLoggedIn(), 'the first call proceeds anonymously');
+
+        $provider->searchByImdbIdRaw('tt2');
+        $this->assertTrue($provider->isLoggedIn(), 'the next call must be allowed one login retry');
+
+        $loginCalls = array_filter($history, static fn (array $h): bool => str_ends_with($h['url'], '/login'));
+        $this->assertCount(2, $loginCalls);
+    }
+
+    /**
+     * Conversely, a CONFIRMED credential rejection (login HTTP 401) stays
+     * latched: dead credentials must not storm the login endpoint once per
+     * business call. Two searches, one login POST.
+     */
+    public function test_confirmed_credential_rejection_stays_latched(): void
+    {
+        $provider = $this->providerWithCredentials();
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(401, '{"message":"bad credentials"}'),
+            self::response(200, '{"data":[]}'),
+            self::response(200, '{"data":[]}'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $provider->searchByImdbIdRaw('tt1');
+        $provider->searchByImdbIdRaw('tt2');
+
+        $loginCalls = array_filter($history, static fn (array $h): bool => str_ends_with($h['url'], '/login'));
+        $this->assertCount(1, $loginCalls);
+        $this->assertFalse($provider->isLoggedIn());
+    }
+
+    // ---------------------------------------------------------------------
     // Credential scoping (review osst__secaudit M05): the consumer key must
     // never ride to a response-supplied link host, and links must be HTTPS.
     // ---------------------------------------------------------------------

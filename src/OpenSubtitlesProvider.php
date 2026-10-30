@@ -163,6 +163,13 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     private const USER_AGENT_CONTACT_URL = 'https://github.com/detain/phlix-plugin-opensubtitles';
 
     /**
+     * Seconds subtracted from a login-advertised `expires_in` when computing
+     * the local token deadline, so a token is refreshed slightly BEFORE the
+     * server would start rejecting it (clock drift + in-flight requests).
+     */
+    private const TOKEN_EXPIRY_SAFETY_SEC = 60;
+
+    /**
      * OpenSubtitles API key (consumer token).
      */
     private string $apiKey;
@@ -222,8 +229,23 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     /**
      * Whether the deferred login has already been attempted this enable cycle.
      * Prevents a failed/absent login from re-hitting the network on every call.
+     * Outcome-classified: a confirmed credential rejection stays latched, a
+     * transient failure unlatches for a retry on the next call.
      */
     private bool $loginAttempted = false;
+
+    /**
+     * Unix timestamp after which {@see $sessionToken} must be treated as dead
+     * (derived from the login response's `expires_in` minus the safety
+     * margin), or null when the response advertised no usable deadline.
+     */
+    private ?int $tokenExpiresAt = null;
+
+    /**
+     * True while a login round-trip is being pumped, so concurrent callers
+     * wait for its outcome instead of firing a parallel second login.
+     */
+    private bool $loginInFlight = false;
 
     /**
      * Logger instance.
@@ -313,6 +335,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         // Credentials may have changed — allow a fresh deferred login on next use.
         $this->sessionToken = null;
         $this->loginAttempted = false;
+        $this->tokenExpiresAt = null;
+        $this->loginInFlight = false;
     }
 
     /**
@@ -389,6 +413,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         }
 
         $this->enabled = true;
+        $this->sessionToken = null;
+        $this->tokenExpiresAt = null;
         $this->loginAttempted = false;
     }
 
@@ -405,6 +431,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     {
         $this->sessionToken = null;
         $this->loginAttempted = false;
+        $this->tokenExpiresAt = null;
+        $this->loginInFlight = false;
         $this->enabled = false;
     }
 
@@ -426,7 +454,16 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     /**
      * Lazily authenticate with OpenSubtitles on first authenticated use.
      *
-     * Runs at most once per enable cycle (guarded by {@see $loginAttempted}).
+     * The deferred login runs at most once at a time (guarded by
+     * {@see $loginInFlight}) and its latch is outcome-classified: a confirmed
+     * credential rejection (4xx except 429) stays latched for the rest of the
+     * enable cycle, while transient failures (transport errors, 429, 5xx)
+     * unlatch so the next call retries — throttled to one login attempt per
+     * business call. A session token whose advertised `expires_in` deadline
+     * has passed is invalidated and refreshed on next use; callers arriving
+     * while a login round-trip is still pumping wait for its outcome instead
+     * of firing a parallel second login.
+     *
      * Login is OPTIONAL — it merely raises download limits — so a failure is
      * logged and the provider continues anonymously rather than throwing and
      * breaking search/download. This is the deferred "connect" half of the
@@ -438,8 +475,19 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      */
     private function ensureConnected(): void
     {
-        if ($this->loginAttempted) {
+        if ($this->loginInFlight) {
+            $this->awaitLoginInFlight();
+
             return;
+        }
+
+        if ($this->loginAttempted) {
+            if ($this->sessionToken === null || !$this->sessionTokenIsExpired()) {
+                return;
+            }
+
+            // Token carried by the server as dead — refresh it.
+            $this->invalidateSession();
         }
 
         $this->loginAttempted = true;
@@ -448,14 +496,115 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             return;
         }
 
-        $this->login();
+        $this->loginInFlight = true;
+
+        try {
+            $this->login();
+        } finally {
+            $this->loginInFlight = false;
+        }
+    }
+
+    /**
+     * Bounded cooperative wait while another call's login is pumping (the
+     * event loop only settles the pending login while we yield).
+     *
+     * Mirrors the wait idiom in {@see httpRequest()}. On timeout the caller
+     * proceeds without a token — login is optional by contract, and looping
+     * forever is never an option in a resident worker.
+     *
+     * @return void
+     */
+    private function awaitLoginInFlight(): void
+    {
+        $maxWait = self::HTTP_TIMEOUT_SEC + 1.0;
+        $waited = 0.0;
+
+        while ($this->loginInFlight && $waited < $maxWait) {
+            usleep(10_000); // 10ms
+            $waited += 0.01;
+        }
+
+        if ($this->loginInFlight) {
+            $this->logger->warning('OpenSubtitles login did not settle within the bounded wait; proceeding without a session token');
+        }
+    }
+
+    /**
+     * Whether the captured session token is past its local expiry deadline.
+     */
+    private function sessionTokenIsExpired(): bool
+    {
+        return $this->tokenExpiresAt !== null && time() >= $this->tokenExpiresAt;
+    }
+
+    /**
+     * Drop the session so the next {@see ensureConnected()} re-authenticates.
+     *
+     * @return void
+     */
+    private function invalidateSession(): void
+    {
+        $this->sessionToken = null;
+        $this->tokenExpiresAt = null;
+        $this->loginAttempted = false;
+    }
+
+    /**
+     * Forced re-auth after the API rejected our session token (HTTP 401 on a
+     * business call). Only meaningful when a token WAS sent — anonymous 401s
+     * (missing key etc.) have nothing to refresh.
+     *
+     * @return bool Whether a fresh session token is now available.
+     */
+    private function attemptReauthAfter401(): bool
+    {
+        if ($this->sessionToken === null) {
+            return false;
+        }
+
+        $this->logger->info('OpenSubtitles rejected the session token (HTTP 401); attempting one re-authentication');
+        $this->invalidateSession();
+        $this->ensureConnected();
+
+        return $this->sessionToken !== null;
+    }
+
+    /**
+     * Local expiry deadline for a freshly obtained token: `expires_in`
+     * seconds minus the {@see TOKEN_EXPIRY_SAFETY_SEC} margin. A missing,
+     * non-numeric, negative, or already-insane value yields null (no local
+     * deadline — the token simply lives until the enable cycle resets it),
+     * and a remaining lifetime at or below the margin yields "now" so the
+     * very next call refreshes.
+     */
+    private static function tokenDeadlineFrom(mixed $expiresIn): ?int
+    {
+        $seconds = is_int($expiresIn) ? $expiresIn : null;
+
+        if ($seconds === null && is_string($expiresIn) && is_numeric($expiresIn)) {
+            $seconds = (int) $expiresIn;
+        }
+
+        if ($seconds === null || $seconds < 0) {
+            return null;
+        }
+
+        if ($seconds <= self::TOKEN_EXPIRY_SAFETY_SEC) {
+            return time();
+        }
+
+        return time() + ($seconds - self::TOKEN_EXPIRY_SAFETY_SEC);
     }
 
     /**
      * Authenticate with OpenSubtitles and obtain a session token.
      *
      * Non-throwing: login is optional, so a transport or credential failure is
-     * logged and the provider stays anonymous.
+     * logged and the provider stays anonymous. The {@see $loginAttempted}
+     * latch is classified by outcome here — transient failures (transport,
+     * 429, 5xx, token-less 2xx) unlatch it for a retry on the next call,
+     * while a confirmed 4xx credential rejection keeps it closed.
      *
      * @return void
      *
@@ -471,13 +620,20 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         try {
             $response = $this->httpRequest('POST', 'login', ['Content-Type' => 'application/json'], $body);
         } catch (OpenSubtitlesException $e) {
+            $this->loginAttempted = false;
             $this->logger->warning('OpenSubtitles login transport failed: ' . $e->getMessage());
 
             return;
         }
 
-        if ($response['status'] < 200 || $response['status'] >= 300) {
-            $this->logger->warning('OpenSubtitles login failed with HTTP ' . $response['status']);
+        $status = $response['status'];
+
+        if ($status < 200 || $status >= 300) {
+            if ($status === 429 || $status >= 500) {
+                $this->loginAttempted = false;
+            }
+
+            $this->logger->warning('OpenSubtitles login failed with HTTP ' . $status);
 
             return;
         }
@@ -485,8 +641,10 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $data = json_decode($response['body'], true);
         if (is_array($data) && isset($data['token']) && is_string($data['token'])) {
             $this->sessionToken = $data['token'];
+            $this->tokenExpiresAt = self::tokenDeadlineFrom($data['expires_in'] ?? null);
             $this->logger->info('OpenSubtitles login successful');
         } else {
+            $this->loginAttempted = false;
             // The class contract is "a failure is logged and the provider stays
             // anonymous" — a 2xx without a usable token was previously silent.
             // Keep it non-throwing (login is optional by design) but loud.
@@ -907,6 +1065,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * @param array<string, string> $queryParams     Query parameters.
      * @param string                $subtitleFormat  Preferred format.
      * @param string                $context         Human label for error logs.
+     * @param bool                  $allowAuthRetry  Internal: whether an HTTP
+     *        401 may consume the single forced re-auth + retry budget (false
+     *        on the retry leg itself, so the budget can never loop).
      *
      * @return list<array{
      *     id: string,
@@ -926,7 +1087,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *         response whose body is not valid JSON or lacks the expected
      *         `data` envelope (never collapsed to an empty result).
      */
-    private function searchSubtitles(array $queryParams, string $subtitleFormat, string $context): array
+    private function searchSubtitles(array $queryParams, string $subtitleFormat, string $context, bool $allowAuthRetry = true): array
     {
         $url = self::API_BASE . 'subtitles?' . http_build_query($queryParams);
 
@@ -939,6 +1100,13 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         }
 
         if ($response['status'] < 200 || $response['status'] >= 300) {
+            // A 401 on a request that carried a session token means the token
+            // died server-side: refresh once and retry the search. The retry
+            // leg runs with the budget spent, so this can never loop.
+            if ($allowAuthRetry && $response['status'] === 401 && $this->attemptReauthAfter401()) {
+                return $this->searchSubtitles($queryParams, $subtitleFormat, $context, false);
+            }
+
             $this->logger->error("OpenSubtitles search by {$context} failed: HTTP " . $response['status']);
 
             throw new OpenSubtitlesException("Search by {$context} failed: HTTP " . $response['status']);
@@ -983,7 +1151,10 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * 1. `POST download` with a `file_id` JSON body returns a JSON envelope
      *    containing a temporary `link` URL plus download-quota accounting. This
      *    call itself counts against the account's download quota, so it must
-     *    never be retried speculatively or looped.
+     *    never be retried speculatively or looped. The ONE sanctioned re-issue
+     *    is after an HTTP 401 session-token rejection — a rejected request
+     *    consumed no quota, so refreshing the token and re-posting once is
+     *    state recovery, not speculation ({@see attemptReauthAfter401()}).
      * 2. The actual subtitle bytes are fetched with a plain `GET` against that
      *    `link` (a different host, not `API_BASE`). The link must be HTTPS and
      *    is fetched WITHOUT the consumer credentials — the API origin is the
@@ -1008,8 +1179,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $this->ensureEnabled();
         $this->ensureConnected();
 
-        $headers = $this->authHeaders();
-        $headers['Content-Type'] = 'application/json';
+        $contentType = ['Content-Type' => 'application/json'];
 
         $body = ['file_id' => $fileId];
         if ($this->format !== '') {
@@ -1017,12 +1187,17 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         }
 
         try {
-            $linkResponse = $this->httpRequest(
-                'POST',
-                self::API_BASE . 'download',
-                $headers,
-                (string) json_encode($body),
-            );
+            $linkResponse = $this->httpRequest('POST', self::API_BASE . 'download', array_merge($contentType, $this->authHeaders()), (string) json_encode($body));
+
+            // A 401 here means our session token died server-side. The
+            // rejected request consumed no quota (auth failed before the
+            // download was registered), so refreshing the token and re-issuing
+            // step-1 once is a bounded, non-speculative retry — the budget is
+            // this single re-issue; a second 401 falls through to the failure
+            // mapper below.
+            if ($linkResponse['status'] === 401 && $this->attemptReauthAfter401()) {
+                $linkResponse = $this->httpRequest('POST', self::API_BASE . 'download', array_merge($contentType, $this->authHeaders()), (string) json_encode($body));
+            }
         } catch (OpenSubtitlesException $e) {
             $this->logger->error('OpenSubtitles download failed: ' . $e->getMessage());
 
