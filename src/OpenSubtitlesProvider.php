@@ -227,10 +227,17 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
 
     /**
      * Test seam replacing the network call. Signature:
-     * `fn(string $method, string $url, array<string,string> $headers, ?string $body): array{status:int, body:string, headers?:array<string,string|list<string>>}`.
+     * `fn(string $method, string $url, array<string,string> $headers, ?string $body)`
+     * returning
+     * `array{status:int, body:string, headers?:array<string,string|list<string>>}`.
      * Left null in production so the real non-blocking Workerman client is used.
      *
-     * @var (\Closure(string, string, array<string,string>, ?string): array{status:int, body:string, headers?:array<string,string|list<string>>})|null
+     * @var (\Closure(
+     *     string,
+     *     string,
+     *     array<string, string>,
+     *     ?string
+     * ): array{status: int, body: string, headers?: array<string, string|list<string>>})|null
      * @internal Tests only.
      */
     private ?\Closure $transport;
@@ -578,7 +585,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         }
 
         if ($this->loginInFlight) {
-            $this->logger->warning('OpenSubtitles login did not settle within the bounded wait; proceeding without a session token');
+            $this->logger->warning(
+                'OpenSubtitles login did not settle within the bounded wait; proceeding without a session token',
+            );
         }
     }
 
@@ -1139,8 +1148,12 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *         response whose body is not valid JSON or lacks the expected
      *         `data` envelope (never collapsed to an empty result).
      */
-    private function searchSubtitles(array $queryParams, string $subtitleFormat, string $context, bool $allowAuthRetry = true): array
-    {
+    private function searchSubtitles(
+        array $queryParams,
+        string $subtitleFormat,
+        string $context,
+        bool $allowAuthRetry = true,
+    ): array {
         $this->guardSearchNotDeferred();
 
         $url = self::API_BASE . 'subtitles?' . http_build_query($queryParams);
@@ -1250,7 +1263,12 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         }
 
         try {
-            $linkResponse = $this->httpRequest('POST', self::API_BASE . 'download', array_merge($contentType, $this->authHeaders()), (string) json_encode($body));
+            $linkResponse = $this->httpRequest(
+                'POST',
+                self::API_BASE . 'download',
+                array_merge($contentType, $this->authHeaders()),
+                (string) json_encode($body),
+            );
 
             // A 401 here means our session token died server-side. The
             // rejected request consumed no quota (auth failed before the
@@ -1259,7 +1277,12 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             // this single re-issue; a second 401 falls through to the failure
             // mapper below.
             if ($linkResponse['status'] === 401 && $this->attemptReauthAfter401()) {
-                $linkResponse = $this->httpRequest('POST', self::API_BASE . 'download', array_merge($contentType, $this->authHeaders()), (string) json_encode($body));
+                $linkResponse = $this->httpRequest(
+                    'POST',
+                    self::API_BASE . 'download',
+                    array_merge($contentType, $this->authHeaders()),
+                    (string) json_encode($body),
+                );
             }
         } catch (OpenSubtitlesException $e) {
             $this->logger->error('OpenSubtitles download failed: ' . $e->getMessage());
@@ -1668,7 +1691,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         }
 
         $this->rateLimitedUntil = $until;
-        $this->logger->warning('OpenSubtitles rate-limited (HTTP 429); requests deferred locally until ' . gmdate('c', $until));
+        $this->logger->warning(
+            'OpenSubtitles rate-limited (HTTP 429); requests deferred locally until ' . gmdate('c', $until),
+        );
     }
 
     /**
@@ -1709,7 +1734,10 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             ? $message
             : 'OpenSubtitles download quota exhausted.';
 
-        $this->logger->warning('OpenSubtitles download quota exhausted until ' . $resetUtc . '; further downloads refused locally until the window resets');
+        $this->logger->warning(
+            'OpenSubtitles download quota exhausted until ' . $resetUtc
+                . '; further downloads refused locally until the window resets',
+        );
     }
 
     /**
@@ -1762,7 +1790,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         }
 
         if ($this->quotaBlockedUntil > time()) {
-            $this->logger->warning('OpenSubtitles download refused locally: quota exhausted until ' . (string) $this->quotaResetTimeUtc);
+            $this->logger->warning(
+                'OpenSubtitles download refused locally: quota exhausted until ' . (string) $this->quotaResetTimeUtc,
+            );
 
             throw new OpenSubtitlesQuotaExceededException(
                 (string) $this->quotaMessage . ' (not retried locally until the quota window resets)',
