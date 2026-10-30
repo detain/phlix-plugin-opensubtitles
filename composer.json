@@ -35,7 +35,7 @@
     },
     "autoload-dev": {
         "psr-4": {
-            "Phlix\\PluginOpenSubtitles\\Tests\\": "tests/"
+            "Phlix\\PluginOpenSubtitles\\Tests\\": "tests/Unit/"
         }
     },
     "config": {
