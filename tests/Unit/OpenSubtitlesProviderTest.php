@@ -2479,16 +2479,16 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertSame('tt1234567', $result['imdb_id']);
     }
 
-    public function test_parse_filename_extracts_year(): void
+    public function test_parse_filename_returns_the_imdb_id_channel_only(): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
         $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'parseFilename');
         $method->setAccessible(true);
 
+        // Title/year had no consumer; re-adding dead extraction breaks this pin.
         $result = $method->invoke($provider, 'Movie Name 2019 720p bluray.mkv');
 
-        $this->assertSame(2019, $result['year']);
-        $this->assertSame('Movie Name', $result['title']);
+        $this->assertSame(['imdb_id' => null], $result);
     }
 
     public function test_parse_filename_returns_nulls_when_no_match(): void
@@ -2497,11 +2497,10 @@ final class OpenSubtitlesProviderTest extends TestCase
         $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'parseFilename');
         $method->setAccessible(true);
 
-        // "some random filename" has no imdb_id and no year at the end
+        // "some random filename" has no embedded IMDb id
         $result = $method->invoke($provider, 'some random filename');
 
         $this->assertNull($result['imdb_id']);
-        $this->assertNull($result['year']);
     }
 
     /**

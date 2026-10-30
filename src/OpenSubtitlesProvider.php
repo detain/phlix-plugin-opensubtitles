@@ -1874,33 +1874,29 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     }
 
     /**
-     * Parse a filename to extract media information.
+     * Extract the channels a filename search can actually use.
+     *
+     * Only the embedded IMDb id is consumed downstream — the search query
+     * itself is the bare pathinfo filename ({@see filenameQueryParams()}) and
+     * the moviehash channel is populated from release metadata, never from a
+     * filename guess. The former title/year extraction was therefore dead
+     * output (and its trim charlist `'.[\\s'` was a literal set, not a regex
+     * class — it stripped '.', '[', '\' and 's'); it is removed rather than
+     * repaired, so the parse boundary carries only what has a consumer.
      *
      * @param string $filename The media filename to parse.
      *
-     * @return array{imdb_id: ?string, hash: ?string, title: ?string, year: ?int}
+     * @return array{imdb_id: ?string}
      *
      * @since 0.1.0
      */
     private function parseFilename(string $filename): array
     {
-        $result = [
-            'imdb_id' => null,
-            'hash' => null,
-            'title' => null,
-            'year' => null,
-        ];
-
         if (preg_match('/(tt\d{7,8})/i', $filename, $matches)) {
-            $result['imdb_id'] = strtolower($matches[1]);
+            return ['imdb_id' => strtolower($matches[1])];
         }
 
-        if (preg_match('/^(.+?)[.\\s]+(\\d{4})/', basename($filename), $yearMatches)) {
-            $result['title'] = trim($yearMatches[1], '.[\\s');
-            $result['year'] = (int) $yearMatches[2];
-        }
-
-        return $result;
+        return ['imdb_id' => null];
     }
 
     /**
