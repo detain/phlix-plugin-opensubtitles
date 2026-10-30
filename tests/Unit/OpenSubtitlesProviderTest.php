@@ -2504,6 +2504,34 @@ final class OpenSubtitlesProviderTest extends TestCase
     }
 
     /**
+     * Parse-boundary fail-fast: results whose language attribute is missing
+     * or not a usable string are SKIPPED, never relabeled with a default.
+     * A fabricated 'en' row would pass host language filters as wrong-language
+     * subtitles (previously the parser invented 'en' for every such row).
+     */
+    public function test_search_skips_results_without_a_usable_language(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'data' => [
+                    ['id' => '1', 'attributes' => ['download_count' => 9, 'files' => [['file_id' => 1, 'file_name' => 'a.srt']]]],
+                    ['id' => '2', 'attributes' => ['language' => '', 'download_count' => 8, 'files' => [['file_id' => 2, 'file_name' => 'b.srt']]]],
+                    ['id' => '3', 'attributes' => ['language' => 'es', 'download_count' => 7, 'files' => [['file_id' => 3, 'file_name' => 'c.srt']]]],
+                ],
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $results = $provider->searchByImdbIdRaw('tt1');
+
+        $this->assertCount(1, $results, 'only the row carrying a real language survives parsing');
+        $this->assertSame('3', $results[0]['id']);
+        $this->assertSame('es', $results[0]['language']);
+    }
+
+    /**
      * @dataProvider languageFilterProvider
      */
     public function test_language_filter(array $languages, ?string $expected): void
@@ -2523,7 +2551,25 @@ final class OpenSubtitlesProviderTest extends TestCase
             'multiple languages' => [['en', 'fr', 'de'], 'en,fr,de'],
             'with whitespace' => [[' en ', ' fr '], 'en,fr'],
             'with empty strings filtered out' => [['en', '', 'fr'], 'en,fr'],
+            'pt-BR maps to legacy pb' => [['pt-BR'], 'pb'],
+            'regional en variants collapse to en' => [['en-US', 'en-GB'], 'en'],
+            'host pt-BR never reaches the wire raw' => [['pt-BR', 'pt'], 'pb,pt'],
+            'dedup after aliasing' => [['pt-BR', 'pb'], 'pb'],
+            'unknown region falls back to primary subtag' => [['zz-TZ'], 'zz'],
         ];
+    }
+
+    /**
+     * Domain-drift guard (opensubtitles__srphp m8): the estate carries BCP-47
+     * codes while OpenSubtitles expects its own set (ISO 639-1 + legacy pb).
+     */
+    public function test_language_filter_maps_estate_codes_to_the_opensubtitles_domain(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'languageFilter');
+        $method->setAccessible(true);
+
+        $this->assertSame('pb', $method->invoke(null, ['pt-BR']));
+        $this->assertStringNotContainsString('pt-BR', (string) $method->invoke(null, ['pt-BR', 'pt']));
     }
 
     /**
@@ -3010,13 +3056,12 @@ final class OpenSubtitlesProviderTest extends TestCase
         ];
 
         $result = $method->invoke($provider, $raw, 'srt');
-        // Entry 1 is skipped (no attributes), entries 2 and 3 both pass
-        // Results are sorted by download_count descending, so entry 3 (10 downloads) comes first
-        $this->assertCount(2, $result);
+        // Entry 1 is skipped (no attributes -> no file_id), entry 2 is skipped
+        // too (no usable language — the parser never fabricates a default),
+        // entry 3 passes with its real language.
+        $this->assertCount(1, $result);
         $this->assertSame(456, $result[0]['file_id']); // 10 downloads
-        $this->assertSame(123, $result[1]['file_id']); // 0 downloads
         $this->assertSame('fr', $result[0]['language']);
-        $this->assertSame('en', $result[1]['language']); // default language
     }
 
     public function test_filter_subtitles_handles_malformed_files_array(): void

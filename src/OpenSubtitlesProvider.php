@@ -131,6 +131,16 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     private const DEFAULT_LANGUAGE = 'en';
 
     /**
+     * Exact aliases from estate BCP-47-style codes to the OpenSubtitles
+     * language domain. OpenSubtitles filters by its own set (ISO 639-1 plus
+     * legacy specials such as `pb` for Brazilian Portuguese); a raw `pt-BR`
+     * filter silently matches nothing there.
+     *
+     * @var array<string, string>
+     */
+    private const LANGUAGE_ALIASES = ['pt-BR' => 'pb'];
+
+    /**
      * Preferred subtitle format when not configured.
      */
     private const DEFAULT_FORMAT = 'srt';
@@ -347,7 +357,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * Does NOT perform any network I/O (no login) — configuration only.
      *
      * @param array<string, mixed> $settings Persisted settings (manifest keys:
-     *        `api_key`, `username`, `password`, `language`, `format`).
+     *        `api_key`, `username`, `password`, `language`, `format`, `priority`).
      *
      * @return void
      *
@@ -749,7 +759,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * Does NOT consume download quota.
      *
      * @param string       $path      Absolute path to the local media file.
-     * @param list<string> $languages ISO 639 codes to filter (empty = no filter).
+     * @param list<string> $languages ISO 639 / BCP-47-style codes to filter
+     *                                (mapped to the OpenSubtitles language
+     *                                domain; empty = no filter).
      *
      * @return list<SubtitleCandidate> Candidates, best-match first.
      *
@@ -796,7 +808,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *
      * @param string       $movieHash OSDb movie hash (16 hex chars).
      * @param int          $byteSize  Exact byte size the hash was computed from.
-     * @param list<string> $languages ISO 639 codes to filter (empty = no filter).
+     * @param list<string> $languages ISO 639 / BCP-47-style codes to filter
+     *                                (mapped to the OpenSubtitles language
+     *                                domain; empty = no filter).
      *
      * @return list<SubtitleCandidate> Candidates, best-match first.
      *
@@ -825,7 +839,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * Contract search by IMDb id (MATCH_IMDB). Does NOT consume download quota.
      *
      * @param string       $imdbId    IMDb id, with or without the `tt` prefix.
-     * @param list<string> $languages ISO 639 codes to filter (empty = no filter).
+     * @param list<string> $languages ISO 639 / BCP-47-style codes to filter
+     *                                (mapped to the OpenSubtitles language
+     *                                domain; empty = no filter).
      *
      * @return list<SubtitleCandidate> Candidates, best-match first.
      *
@@ -1968,7 +1984,15 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             $primaryFile = $files[0];
             $filename = $primaryFile['file_name'] ?? "subtitle.{$preferredFormat}";
             $format = self::formatFromFilename($primaryFile['file_name']) ?? $preferredFormat;
-            $languageCode = is_string($attributes['language'] ?? null) ? $attributes['language'] : 'en';
+            $languageRaw = $attributes['language'] ?? null;
+            if (!is_string($languageRaw) || trim($languageRaw) === '') {
+                // Parse-boundary fail-fast: a result without a usable language
+                // is skipped, never relabeled a default — a fabricated 'en'
+                // would pass host language filters with wrong-language text.
+                continue;
+            }
+
+            $languageCode = $languageRaw;
             $downloadCount = is_int($attributes['download_count'] ?? null) ? $attributes['download_count'] : 0;
             $imdbId = self::normalizeImdbId($featureDetails['imdb_id'] ?? null);
             $rating = self::floatOrNull($attributes['ratings'] ?? null);
@@ -2176,7 +2200,15 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * Reduce a language list to the OpenSubtitles comma-separated `languages`
      * filter value, or null when no filter should be applied (empty list).
      *
-     * @param list<string> $languages ISO 639 codes.
+     * Host-side codes (estate BCP-47-style, e.g. `en-US`, `pt-BR`) are mapped
+     * into the OpenSubtitles language domain before they are sent: an exact
+     * {@see LANGUAGE_ALIASES} hit wins (so `pt-BR` becomes the legacy `pb`),
+     * otherwise a region subtag is stripped (`en-US` queries `en`). Plain
+     * codes pass through untouched. The filter the host asked for is thus
+     * honored in the provider's own vocabulary instead of silently matching
+     * nothing.
+     *
+     * @param list<string> $languages ISO 639 / BCP-47-style codes.
      *
      * @return string|null
      *
@@ -2184,12 +2216,22 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      */
     private static function languageFilter(array $languages): ?string
     {
-        $clean = array_values(array_filter(
-            array_map(static fn (string $l): string => trim($l), $languages),
-            static fn (string $l): bool => $l !== '',
-        ));
+        $clean = [];
+        foreach ($languages as $language) {
+            $language = trim($language);
+            if ($language === '') {
+                continue;
+            }
 
-        return $clean === [] ? null : implode(',', $clean);
+            $normalized = self::LANGUAGE_ALIASES[$language] ?? $language;
+            if ($normalized === $language && preg_match('/^[a-zA-Z]{2,3}-/', $language) === 1) {
+                $normalized = substr($language, 0, (int) strpos($language, '-'));
+            }
+
+            $clean[$normalized] = true;
+        }
+
+        return $clean === [] ? null : implode(',', array_keys($clean));
     }
 
     /**
