@@ -42,8 +42,13 @@ use Workerman\Http\Response;
  * - {@see onEnable()} — the cheap "wire" step. Adopts the host logger and marks
  *   the provider enabled. It performs **NO network I/O and never logs in.**
  * - {@see ensureConnected()} — the lazy "connect" step. The first authenticated
- *   API call (search/download) logs in to obtain a session token, once per
- *   enable cycle. Never at boot.
+ *   API call (search/download) logs in to obtain a session token; never at
+ *   boot. Afterwards the token lives until its advertised `expires_in`
+ *   deadline passes or the server revokes it (an HTTP 401 on a business call
+ *   triggers exactly one refresh-and-retry), and a confirmed credential
+ *   rejection suppresses further attempts for the enable cycle. Configured
+ *   without username/password the provider stays anonymous — the consumer
+ *   key alone works search at lower download limits.
  *
  * ## Non-blocking HTTP
  *

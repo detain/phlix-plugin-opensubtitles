@@ -50,9 +50,26 @@ account `username`/`password` as well is optional but raises your download quota
 
 The plugin implements the `Phlix\Shared\Plugin\LifecycleInterface`, `Phlix\Shared\Plugin\ConfigurableInterface`, and `Phlix\Shared\Subtitle\SubtitleSourceInterface` contracts and connects to the OpenSubtitles REST API v1:
 
-1. **Login** — registers a user agent and obtains a session token
-2. **Search** — queries subtitles by IMDB ID, filename, or `moviehash`
-3. **Download** — fetches the subtitle file and feeds it into Phlix's subtitle pipeline
+1. **Login — lazy and conditional** — nothing authenticates at install, enable,
+   or boot. On the first search/download with `username`/`password` configured,
+   the plugin obtains a session token (`POST /login`) and sends it as
+   `Authorization: Bearer <token>` on API-origin requests. The token is
+   refreshed when it reaches its advertised expiry or the server revokes it (a
+   mid-session HTTP 401 costs exactly one refresh-and-retry, never a loop); a
+   confirmed credential rejection suppresses further attempts for the enable
+   cycle. Without username/password the plugin runs anonymously on the
+   `api_key` alone — lower download limits, full search. The REST v1 API has
+   **no user-agent registration endpoint**; see “User-Agent & OpenSubtitles
+   ToS” below for what actually satisfies the terms.
+2. **Search** — queries subtitles by IMDB ID, filename, or `moviehash`.
+3. **Download — two steps** — `POST /download` with the file id consumes ONE
+   quota unit and returns a temporary HTTPS link plus quota accounting; the
+   plugin then fetches that link with a plain, **credential-free HTTPS GET**
+   (the consumer key and session token never leave the API origin, and
+   non-HTTPS links are refused). Because step 1 meters the quota per call, a
+   file is posted for at most once per intentional request — never loop
+   `download()` speculatively, and treat the quota exception below as "stop
+   for this window".
 
 When the account's download quota is exhausted, the shared-contract entry
 point `download()` throws `Phlix\Shared\Subtitle\Exception\QuotaExceeded` —
@@ -67,9 +84,27 @@ API reports an exhausted window (`remaining: 0` with a future
 boundary types until that reset — the plugin never re-dials a window the
 vendor declared dead.
 
-## API
+## User-Agent & OpenSubtitles ToS
 
-The OpenSubtitles REST API is documented at [opensubtitles.com](https://www.opensubtitles.com/).
+Every request this plugin makes — API origin and download-link hosts alike —
+carries the descriptive, contact-bearing `User-Agent` that OpenSubtitles'
+terms require:
+
+```text
+Phlix-Plugin-OpenSubtitles/<plugin version> (+https://github.com/detain/phlix-plugin-opensubtitles)
+```
+
+The version comes from `plugin.json`; the contact route is the
+`USER_AGENT_CONTACT_URL` constant in the provider. The REST v1 API performs
+no user-agent registration handshake — the header itself IS the disclosure,
+and it is the vendor's path back to the maintainer. Non-descriptive or
+contact-less agents get the consumer key rate-limited or banned, and a ban
+lands on every Phlix instance sharing the build. **Forks and derivatives MUST
+replace the product name and `USER_AGENT_CONTACT_URL` with their own identity
+and contact route before publishing.**
+
+API references: [REST API docs](https://www.opensubtitles.com/en/doc/apis) ·
+[consumer (API application) portal](https://www.opensubtitles.com/en/consumers).
 
 ## License
 
