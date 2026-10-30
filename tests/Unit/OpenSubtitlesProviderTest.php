@@ -227,6 +227,86 @@ final class OpenSubtitlesProviderTest extends TestCase
     }
 
     // ---------------------------------------------------------------------
+    // Strict TLS verification (review osst__secaudit M03): per-host clients
+    // with an explicit verify_peer / verify_peer_name / SNI context.
+    // ---------------------------------------------------------------------
+
+    /**
+     * The strict ssl context must be explicit: the vendored
+     * workerman/http-client v3.1.3 ConnectionPool::create() defaults to
+     * verify_peer=false, verify_peer_name=false, allow_self_signed=true and a
+     * shallow array_merge lets client-level 'context' options replace its
+     * per-address 'ssl' key wholesale — so the override must carry its own
+     * per-connection identity (peer_name/server_name), which is why the
+     * provider builds one client per target host.
+     */
+    public function test_strict_tls_context_pins_verification_for_the_peer_host(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'strictTlsContext');
+        $method->setAccessible(true);
+
+        /** @var array<string, mixed> $ctx */
+        $ctx = $method->invoke(null, 'api.opensubtitles.com');
+
+        $this->assertTrue($ctx['verify_peer']);
+        $this->assertTrue($ctx['verify_peer_name']);
+        $this->assertFalse($ctx['allow_self_signed']);
+        $this->assertSame('api.opensubtitles.com', $ctx['peer_name']);
+        $this->assertSame('api.opensubtitles.com', $ctx['server_name']);
+    }
+
+    public function test_http_client_for_opens_strict_tls_context_per_host(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'httpClientFor');
+        $method->setAccessible(true);
+
+        /** @var \Workerman\Http\Client $apiClient */
+        $apiClient = $method->invoke($provider, 'https://api.opensubtitles.com/api/v1/login');
+        /** @var \Workerman\Http\Client $linkClient */
+        $linkClient = $method->invoke($provider, 'https://dl.opensubtitles.org/dl/abc.srt');
+
+        $poolOptions = static function (\Workerman\Http\Client $client): array {
+            $poolProp = new \ReflectionProperty(\Workerman\Http\Client::class, '_connectionPool');
+            $poolProp->setAccessible(true);
+            $pool = $poolProp->getValue($client);
+            $optionsProp = new \ReflectionProperty($pool, 'options');
+            $optionsProp->setAccessible(true);
+
+            /** @var array<string, mixed> */
+            return $optionsProp->getValue($pool);
+        };
+
+        $apiCtx = $poolOptions($apiClient)['context']['ssl'] ?? [];
+        $linkCtx = $poolOptions($linkClient)['context']['ssl'] ?? [];
+
+        $this->assertTrue($apiCtx['verify_peer'] ?? false, 'API-host client must verify peer');
+        $this->assertSame('api.opensubtitles.com', $apiCtx['peer_name'] ?? null);
+        $this->assertTrue($linkCtx['verify_peer'] ?? false, 'link-host client must verify peer');
+        $this->assertSame('dl.opensubtitles.org', $linkCtx['peer_name'] ?? null, 'each host pins its own identity');
+
+        // Same host → same cached client; different host → distinct client.
+        /** @var \Workerman\Http\Client $apiClientAgain */
+        $apiClientAgain = $method->invoke($provider, 'https://api.opensubtitles.com/api/v1/subtitles');
+        $this->assertSame($apiClient, $apiClientAgain);
+        $this->assertNotSame($apiClient, $linkClient);
+    }
+
+    public function test_http_client_for_fails_loud_on_hostless_url(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'httpClientFor');
+        $method->setAccessible(true);
+
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessageMatches('/no host/i');
+
+        $method->invoke($provider, 'not-a-url');
+    }
+
+    // ---------------------------------------------------------------------
     // Default headers (User-Agent derived from plugin.json)
     // ---------------------------------------------------------------------
 
@@ -2072,22 +2152,22 @@ final class OpenSubtitlesProviderTest extends TestCase
     // getHttpClient lazy initialization
     // ---------------------------------------------------------------------
 
-    public function test_get_http_client_lazily_initializes(): void
+    public function test_http_clients_are_created_lazily_and_cached_per_host(): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
 
-        // Use reflection to verify httpClient starts as null
-        $prop = new \ReflectionProperty(OpenSubtitlesProvider::class, 'httpClient');
+        $prop = new \ReflectionProperty(OpenSubtitlesProvider::class, 'httpClients');
         $prop->setAccessible(true);
-        $this->assertNull($prop->getValue($provider));
+        $this->assertSame([], $prop->getValue($provider), 'no client before the first real request');
 
-        // getHttpClient should create it
-        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'getHttpClient');
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'httpClientFor');
         $method->setAccessible(true);
-        $client = $method->invoke($provider);
+        $method->invoke($provider, 'https://api.opensubtitles.com/api/v1/login');
 
-        $this->assertInstanceOf(\Workerman\Http\Client::class, $client);
-        $this->assertNotNull($prop->getValue($provider));
+        $clients = $prop->getValue($provider);
+        $this->assertCount(1, $clients);
+        $this->assertArrayHasKey('api.opensubtitles.com', $clients);
+        $this->assertInstanceOf(\Workerman\Http\Client::class, $clients['api.opensubtitles.com']);
     }
 
     // ---------------------------------------------------------------------

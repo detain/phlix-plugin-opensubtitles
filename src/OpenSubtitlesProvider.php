@@ -49,8 +49,11 @@ use Workerman\Http\Response;
  *
  * All HTTP goes through {@see httpRequest()}, which uses the non-blocking
  * `workerman/http-client` with the canonical cooperative-wait pattern (see
- * phlix-server `CLAUDE.md`). A closure `$transport` seam lets tests exercise
- * the request/response shaping without an event loop or the network.
+ * phlix-server `CLAUDE.md`). Every connection is dialed with an explicit
+ * strict TLS verification context ({@see strictTlsContext()}); the vendored
+ * client's verification-off defaults are overridden, never inherited. A
+ * closure `$transport` seam lets tests exercise the request/response shaping
+ * without an event loop or the network.
  *
  * ## Download quota
  *
@@ -97,10 +100,16 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     private const DEFAULT_PRIORITY = 10;
 
     /**
+     * API host the plugin's consumer credentials belong to. Used to build
+     * {@see API_BASE} and to scope credential headers to their origin.
+     */
+    private const API_HOST = 'api.opensubtitles.com';
+
+    /**
      * OpenSubtitles API base URL. Keeps a trailing slash; request paths are
      * appended without a leading slash so the `/api/v1` prefix is preserved.
      */
-    private const API_BASE = 'https://api.opensubtitles.com/api/v1/';
+    private const API_BASE = 'https://' . self::API_HOST . '/api/v1/';
 
     /**
      * Default language code when not configured.
@@ -171,9 +180,16 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     private int $priority;
 
     /**
-     * Shared non-blocking HTTP client, created lazily on first real request.
+     * Shared non-blocking HTTP clients, created lazily on first real request,
+     * keyed by target host. One client per host because the vendored
+     * workerman/http-client pool merges client-level ssl options wholesale —
+     * a per-host context is the only way to pin strict verification plus the
+     * right `peer_name`/SNI identity for every host this plugin dials
+     * (see {@see httpClientFor()}).
+     *
+     * @var array<string,Client>
      */
-    private ?Client $httpClient = null;
+    private array $httpClients = [];
 
     /**
      * Test seam replacing the network call. Signature:
@@ -1193,7 +1209,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             $options['data'] = $body;
         }
 
-        $this->getHttpClient()->request($url, $options);
+        $this->httpClientFor($url)->request($url, $options);
 
         // Cooperative wait — yields to the event loop (Swoole coroutine hooks
         // make usleep yield), allowing other tasks to proceed meanwhile.
@@ -1283,15 +1299,59 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     }
 
     /**
-     * Get or lazily create the shared non-blocking HTTP client.
+     * The explicit strict TLS verification context for one peer host.
+     *
+     * The vendored `workerman/http-client` v3.1.3 `ConnectionPool::create()`
+     * defaults to `verify_peer => false`, `verify_peer_name => false`,
+     * `allow_self_signed => true` — verification is OFF unless configured —
+     * on the exact socket stack that carries the account password
+     * (`POST login`) and the consumer Api-Key on every request. This estate
+     * already learned that lesson the hard way on the same connection layer
+     * (phlix-hub `519c0c0`), so the hardening ships as configuration and is
+     * never left to library charity.
+     *
+     * The pool merges client-level `context` options over its own base with a
+     * SHALLOW `array_merge`, replacing the whole `ssl` key — including the
+     * per-address `peer_name` the pool had just derived. The context must
+     * therefore carry its own identity, which is why clients are built per
+     * target host ({@see httpClientFor()}) instead of sharing one.
+     *
+     * @return array{verify_peer:bool,verify_peer_name:bool,allow_self_signed:bool,peer_name:string,server_name:string}
      */
-    private function getHttpClient(): Client
+    private static function strictTlsContext(string $peerHost): array
     {
-        if ($this->httpClient === null) {
-            $this->httpClient = new Client(['timeout' => self::HTTP_TIMEOUT_SEC]);
+        return [
+            'verify_peer' => true,
+            'verify_peer_name' => true,
+            'allow_self_signed' => false,
+            // Certificate name verification target ...
+            'peer_name' => $peerHost,
+            // ... and the SNI identity sent in the ClientHello.
+            'server_name' => $peerHost,
+        ];
+    }
+
+    /**
+     * The shared non-blocking HTTP client for the target host of `$url`,
+     * created lazily with strict TLS verification ({@see strictTlsContext()}).
+     *
+     * @throws OpenSubtitlesException When the URL carries no host to verify.
+     */
+    private function httpClientFor(string $url): Client
+    {
+        $host = parse_url($url, PHP_URL_HOST);
+        if (!is_string($host) || $host === '') {
+            throw new OpenSubtitlesException('HTTP request URL carries no host to verify: ' . $url);
         }
 
-        return $this->httpClient;
+        if (!isset($this->httpClients[$host])) {
+            $this->httpClients[$host] = new Client([
+                'timeout' => self::HTTP_TIMEOUT_SEC,
+                'context' => ['ssl' => self::strictTlsContext($host)],
+            ]);
+        }
+
+        return $this->httpClients[$host];
     }
 
     /**
