@@ -213,10 +213,10 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
 
     /**
      * Test seam replacing the network call. Signature:
-     * `fn(string $method, string $url, array<string,string> $headers, ?string $body): array{status:int, body:string}`.
+     * `fn(string $method, string $url, array<string,string> $headers, ?string $body): array{status:int, body:string, headers?:array<string,string|list<string>>}`.
      * Left null in production so the real non-blocking Workerman client is used.
      *
-     * @var (\Closure(string, string, array<string,string>, ?string): array{status:int, body:string})|null
+     * @var (\Closure(string, string, array<string,string>, ?string): array{status:int, body:string, headers?:array<string,string|list<string>>})|null
      * @internal Tests only.
      */
     private ?\Closure $transport;
@@ -246,6 +246,30 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * wait for its outcome instead of firing a parallel second login.
      */
     private bool $loginInFlight = false;
+
+    /**
+     * Unix timestamp until which step-1 download POSTs are REFUSED LOCALLY
+     * (no network) because the API reported `remaining: 0` with a concrete
+     * future `reset_time_utc` — the orchestrator's multi-file loop must not
+     * storm an already-exhausted quota window.
+     */
+    private ?int $quotaBlockedUntil = null;
+
+    /**
+     * Unix timestamp until which API calls are refused locally because a
+     * 429 carried a parsable `Retry-After`.
+     */
+    private ?int $rateLimitedUntil = null;
+
+    /**
+     * Quota-window context remembered for the local refusal so the surfaced
+     * exception keeps the API's own fields ({@see OpenSubtitlesQuotaExceededException}).
+     */
+    private ?string $quotaMessage = null;
+
+    private ?string $quotaResetTime = null;
+
+    private ?string $quotaResetTimeUtc = null;
 
     /**
      * Logger instance.
@@ -332,11 +356,30 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
 
         $this->priority = self::coercePriority($settings['priority'] ?? null);
 
-        // Credentials may have changed — allow a fresh deferred login on next use.
+        // Credentials may have changed — drop the session and any remembered
+        // quota/rate windows, and allow a fresh deferred login on next use.
+        $this->resetTransientState();
+    }
+
+    /**
+     * Clear all per-session runtime state: the auth lifecycle (token, latch,
+     * expiry, in-flight) and the remembered budget windows. Called from
+     * {@see configure()}, {@see onEnable()} and {@see onDisable()} so nothing
+     * survives a reconfiguration or an enable cycle boundary.
+     *
+     * @return void
+     */
+    private function resetTransientState(): void
+    {
         $this->sessionToken = null;
         $this->loginAttempted = false;
         $this->tokenExpiresAt = null;
         $this->loginInFlight = false;
+        $this->quotaBlockedUntil = null;
+        $this->rateLimitedUntil = null;
+        $this->quotaMessage = null;
+        $this->quotaResetTime = null;
+        $this->quotaResetTimeUtc = null;
     }
 
     /**
@@ -413,9 +456,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         }
 
         $this->enabled = true;
-        $this->sessionToken = null;
-        $this->tokenExpiresAt = null;
-        $this->loginAttempted = false;
+        $this->resetTransientState();
     }
 
     /**
@@ -429,10 +470,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      */
     public function onDisable(): void
     {
-        $this->sessionToken = null;
-        $this->loginAttempted = false;
-        $this->tokenExpiresAt = null;
-        $this->loginInFlight = false;
+        $this->resetTransientState();
         $this->enabled = false;
     }
 
@@ -1089,6 +1127,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      */
     private function searchSubtitles(array $queryParams, string $subtitleFormat, string $context, bool $allowAuthRetry = true): array
     {
+        $this->guardSearchNotDeferred();
+
         $url = self::API_BASE . 'subtitles?' . http_build_query($queryParams);
 
         try {
@@ -1106,6 +1146,10 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             if ($allowAuthRetry && $response['status'] === 401 && $this->attemptReauthAfter401()) {
                 return $this->searchSubtitles($queryParams, $subtitleFormat, $context, false);
             }
+
+            // A 429's Retry-After is a server-imposed pause; honor it locally
+            // for subsequent calls (no dials inside the window).
+            $this->rememberRateWindow($response);
 
             $this->logger->error("OpenSubtitles search by {$context} failed: HTTP " . $response['status']);
 
@@ -1177,6 +1221,11 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     public function downloadRaw(int $fileId): SubtitleDownload
     {
         $this->ensureEnabled();
+
+        // Local fail-fast BEFORE any dial (login included): storming a window
+        // the API already declared dead only deepens the hole.
+        $this->guardDownloadNotDeferred();
+
         $this->ensureConnected();
 
         $contentType = ['Content-Type' => 'application/json'];
@@ -1207,6 +1256,12 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $decoded = json_decode($linkResponse['body'], true);
         /** @var array<string, mixed> $data */
         $data = is_array($decoded) ? $decoded : [];
+
+        // Remember the window BEFORE surfacing the failure, so the caller's
+        // next attempt (the orchestrator may be looping files) is refused
+        // locally instead of re-dialing a declared-dead quota/rate window.
+        $this->rememberQuotaWindow($data);
+        $this->rememberRateWindow($linkResponse);
 
         if ($linkResponse['status'] >= 400) {
             throw $this->mapDownloadLinkFailure($linkResponse['status'], $data);
@@ -1361,7 +1416,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * @param array<string, string> $headers Request headers.
      * @param string|null           $body    Raw request body (JSON), or null.
      *
-     * @return array{status:int, body:string}
+     * @return array{status:int, body:string, headers?:array<string,string|list<string>>}
+     *         `headers` is the response-header map (always present on the real
+     *         transport; a seam may omit it when the scenario needs none).
      *
      * @throws OpenSubtitlesException On transport/network failure or an over-cap response.
      */
@@ -1380,7 +1437,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             return self::assertWithinResponseCap(($this->transport)($method, $url, $headers, $body));
         }
 
-        $state = ['status' => 0, 'body' => '', 'error' => null, 'done' => false];
+        $state = ['status' => 0, 'body' => '', 'headers' => [], 'error' => null, 'done' => false];
 
         // Running total of streamed response bytes (the client emits each
         // body chunk through `progress` before writing it to its buffer).
@@ -1401,6 +1458,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             'success' => function (Response $response) use (&$state): void {
                 $state['status'] = $response->getStatusCode();
                 $state['body'] = $response->getBody()->getContents();
+                // PSR-7 shape: array<string, list<string>>. The 429 Retry-After
+                // and future header consumers read it through headerValue().
+                $state['headers'] = $response->getHeaders();
                 $state['done'] = true;
             },
             'error' => function (Throwable $error) use (&$state): void {
@@ -1437,8 +1497,17 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         }
 
         // Authoritative single choke point: covers the real transport result
-        // exactly as it covers the seam above.
-        return self::assertWithinResponseCap(['status' => $state['status'], 'body' => $state['body']]);
+        // exactly as it covers the seam above. $state['headers'] is provably
+        // either the PSR-7 getHeaders() map (string header names) or the
+        // initial empty array.
+        /** @var array<string, list<string>> $responseHeaders */
+        $responseHeaders = $state['headers'];
+
+        return self::assertWithinResponseCap([
+            'status' => $state['status'],
+            'body' => $state['body'],
+            'headers' => $responseHeaders,
+        ]);
     }
 
     /**
@@ -1459,9 +1528,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * Early-exit on the healthy path; an over-cap body never reaches a caller
      * as a return value (fail loud, never partial or empty "success").
      *
-     * @param array{status:int, body:string} $response
+     * @param array{status:int, body:string, headers?:array<string,string|list<string>>} $response
      *
-     * @return array{status:int, body:string} The unchanged response.
+     * @return array{status:int, body:string, headers?:array<string,string|list<string>>} The unchanged response.
      *
      * @throws OpenSubtitlesException When the body exceeds the cap.
      *
@@ -1527,6 +1596,169 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         return [
             'User-Agent' => self::userAgent(),
         ];
+    }
+
+    /**
+     * Read one response header case-insensitively. Real transports deliver
+     * PSR-7 `list<string>` values; seams may carry a plain string. Anything
+     * else (missing, empty list, non-scalar) reads as null — no window.
+     *
+     * @param array<array-key, mixed> $headers
+     */
+    private static function headerValue(array $headers, string $name): ?string
+    {
+        foreach ($headers as $key => $value) {
+            if (!is_string($key) || strcasecmp($key, $name) !== 0) {
+                continue;
+            }
+
+            if (is_array($value)) {
+                $value = reset($value);
+            }
+
+            if (is_string($value) || is_numeric($value)) {
+                return (string) $value;
+            }
+
+            return null;
+        }
+
+        return null;
+    }
+
+    /**
+     * Remember a server-imposed HTTP 429 `Retry-After` window (delta-seconds
+     * or HTTP-date) so subsequent calls refuse locally until it passes. A
+     * missing or unparsable header latches nothing — honest: without a
+     * promised window the next call goes to the network as it always has.
+     *
+     * @param array{status:int, body:string, headers?:array<string,string|list<string>>} $response
+     *
+     * @return void
+     */
+    private function rememberRateWindow(array $response): void
+    {
+        if ($response['status'] !== 429) {
+            return;
+        }
+
+        $retryAfter = self::headerValue($response['headers'] ?? [], 'Retry-After');
+        if ($retryAfter === null) {
+            return;
+        }
+
+        $until = ctype_digit($retryAfter) ? time() + (int) $retryAfter : strtotime($retryAfter);
+
+        if (!is_int($until) || $until <= time()) {
+            return;
+        }
+
+        $this->rateLimitedUntil = $until;
+        $this->logger->warning('OpenSubtitles rate-limited (HTTP 429); requests deferred locally until ' . gmdate('c', $until));
+    }
+
+    /**
+     * Remember an exhausted download window (`remaining: 0` with a concrete
+     * future `reset_time_utc`) so the caller's file loop cannot storm the
+     * quota-consuming step-1 POST inside a window the API already declared
+     * dead. A missing, unparsable, or past reset advertises no trustworthy
+     * window: nothing latches, the next call re-dials and takes its honest
+     * answer from the API.
+     *
+     * @param array<string, mixed> $data Decoded step-1 response body.
+     *
+     * @return void
+     */
+    private function rememberQuotaWindow(array $data): void
+    {
+        $remaining = $data['remaining'] ?? null;
+        if (!is_int($remaining) || $remaining !== 0) {
+            return;
+        }
+
+        $resetUtc = $data['reset_time_utc'] ?? null;
+        if (!is_string($resetUtc) || $resetUtc === '') {
+            return;
+        }
+
+        $until = strtotime($resetUtc);
+        if ($until === false || $until <= time()) {
+            return;
+        }
+
+        $this->quotaBlockedUntil = $until;
+        $this->quotaResetTimeUtc = $resetUtc;
+        $this->quotaResetTime = is_string($data['reset_time'] ?? null) ? $data['reset_time'] : null;
+
+        $message = $data['message'] ?? null;
+        $this->quotaMessage = is_string($message) && $message !== ''
+            ? $message
+            : 'OpenSubtitles download quota exhausted.';
+
+        $this->logger->warning('OpenSubtitles download quota exhausted until ' . $resetUtc . '; further downloads refused locally until the window resets');
+    }
+
+    /**
+     * Fail-fast guard for searches: refuse locally (zero network) inside a
+     * remembered 429 window; a passed window clears itself.
+     *
+     * @throws OpenSubtitlesException While the rate window is active.
+     */
+    private function guardSearchNotDeferred(): void
+    {
+        if ($this->rateLimitedUntil === null) {
+            return;
+        }
+
+        if ($this->rateLimitedUntil > time()) {
+            throw new OpenSubtitlesException(
+                'Search deferred: OpenSubtitles rate-limited window active until '
+                    . gmdate('c', $this->rateLimitedUntil),
+            );
+        }
+
+        $this->rateLimitedUntil = null;
+    }
+
+    /**
+     * Fail-fast guard for downloads: refuse locally (zero network) inside a
+     * remembered 429 window, and surface the API's own quota context as the
+     * familiar {@see OpenSubtitlesQuotaExceededException} inside a remembered
+     * exhausted window (download() translates it to the shared QuotaExceeded
+     * exactly as it translates a network-surfaced one).
+     *
+     * @throws OpenSubtitlesException While a rate window is active.
+     * @throws OpenSubtitlesQuotaExceededException While the quota window is exhausted.
+     */
+    private function guardDownloadNotDeferred(): void
+    {
+        if ($this->rateLimitedUntil !== null) {
+            if ($this->rateLimitedUntil > time()) {
+                throw new OpenSubtitlesException(
+                    'Download deferred: OpenSubtitles rate-limited window active until '
+                        . gmdate('c', $this->rateLimitedUntil),
+                );
+            }
+
+            $this->rateLimitedUntil = null;
+        }
+
+        if ($this->quotaBlockedUntil === null) {
+            return;
+        }
+
+        if ($this->quotaBlockedUntil > time()) {
+            $this->logger->warning('OpenSubtitles download refused locally: quota exhausted until ' . (string) $this->quotaResetTimeUtc);
+
+            throw new OpenSubtitlesQuotaExceededException(
+                (string) $this->quotaMessage . ' (not retried locally until the quota window resets)',
+                resetTime: $this->quotaResetTime,
+                resetTimeUtc: $this->quotaResetTimeUtc,
+                downloadsRemaining: 0,
+            );
+        }
+
+        $this->quotaBlockedUntil = null;
     }
 
     /**

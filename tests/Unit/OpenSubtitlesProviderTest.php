@@ -447,6 +447,179 @@ final class OpenSubtitlesProviderTest extends TestCase
     }
 
     // ---------------------------------------------------------------------
+    // Budget & rate-limit memory (review osst__secaudit M07): a consumed
+    // quota window and a 429 Retry-After must be REMEMBERED and honored with
+    // a local refusal — the API must never be re dialed inside a known-dead
+    // window (the orchestrator's multi-file loop is the storm vector).
+    // ---------------------------------------------------------------------
+
+    public function test_exhausted_quota_with_future_reset_blocks_next_download_locally(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $future = gmdate('Y-m-d\TH:i:s\Z', time() + 3600);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'remaining' => 0,
+                'reset_time' => 'in an hour',
+                'reset_time_utc' => $future,
+                'message' => 'You have downloaded your allowed 20 subtitles for 24h.',
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->downloadRaw(1);
+            $this->fail('Expected OpenSubtitlesQuotaExceededException.');
+        } catch (OpenSubtitlesQuotaExceededException $e) {
+            $this->assertStringContainsString('allowed 20 subtitles', $e->getMessage());
+        }
+
+        $this->assertCount(1, $history);
+
+        try {
+            $provider->downloadRaw(2);
+            $this->fail('Expected the remembered quota window to refuse locally.');
+        } catch (OpenSubtitlesQuotaExceededException $e) {
+            $this->assertStringContainsString('not retried locally', $e->getMessage());
+            $this->assertSame($future, $e->resetTimeUtc);
+            $this->assertSame(0, $e->downloadsRemaining);
+        }
+
+        $this->assertCount(1, $history, 'the local refusal must never dial out');
+    }
+
+    public function test_last_download_of_the_window_remembers_the_reset_for_the_next_call(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $future = gmdate('Y-m-d\TH:i:s\Z', time() + 3600);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'link' => 'https://dl.example-cdn.org/f.srt',
+                'file_name' => 'f.srt',
+                'remaining' => 0,
+                'reset_time_utc' => $future,
+            ])),
+            self::response(200, "1\n00:00:01,000 --> 00:00:02,000\nhi\n"),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $download = $provider->downloadRaw(1);
+        $this->assertSame('f.srt', $download->fileName);
+
+        try {
+            $provider->downloadRaw(2);
+            $this->fail('Expected the just-closed quota window to block locally.');
+        } catch (OpenSubtitlesQuotaExceededException $e) {
+            $this->assertStringContainsString('not retried locally', $e->getMessage());
+        }
+
+        $this->assertCount(2, $history, 'the blocked second download must not dial out');
+    }
+
+    public function test_download_429_retry_after_is_honored_locally(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(429, '{"message":"Too Many Requests"}', ['Retry-After' => '120']),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->downloadRaw(1);
+            $this->fail('Expected the 429 to surface as a failure.');
+        } catch (OpenSubtitlesException $e) {
+            $this->assertStringContainsString('Download failed', $e->getMessage());
+        }
+
+        try {
+            $provider->downloadRaw(2);
+            $this->fail('Expected the remembered rate window to refuse locally.');
+        } catch (OpenSubtitlesException $e) {
+            $this->assertStringContainsString('rate-limited', $e->getMessage());
+            $this->assertNotInstanceOf(OpenSubtitlesQuotaExceededException::class, $e);
+        }
+
+        $this->assertCount(1, $history, 'Retry-After must be honored without dialing out');
+    }
+
+    public function test_search_429_http_date_retry_after_defers_the_next_search(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(429, '{"message":"slow down"}', ['Retry-After' => gmdate(DATE_RFC7231, time() + 3600)]),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->searchByImdbIdRaw('tt1');
+            $this->fail('Expected the 429 to surface as a failure.');
+        } catch (OpenSubtitlesException $e) {
+            $this->assertStringContainsString('failed: HTTP 429', $e->getMessage());
+        }
+
+        try {
+            $provider->searchByImdbIdRaw('tt2');
+            $this->fail('Expected the remembered rate window to defer locally.');
+        } catch (OpenSubtitlesException $e) {
+            $this->assertStringContainsString('rate-limited window', $e->getMessage());
+        }
+
+        $this->assertCount(1, $history);
+    }
+
+    public function test_past_reset_time_never_latches_a_local_block(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $history = [];
+        $quotaBody = (string) json_encode([
+            'remaining' => 0,
+            'reset_time_utc' => '2023-05-24T23:59:59Z',
+            'message' => 'You have downloaded your allowed 20 subtitles for 24h.',
+        ]);
+        $this->installFakeTransport($provider, [
+            self::response(200, $quotaBody),
+            self::response(200, $quotaBody),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        foreach ([1, 2] as $fileId) {
+            try {
+                $provider->downloadRaw($fileId);
+                $this->fail('Expected OpenSubtitlesQuotaExceededException.');
+            } catch (OpenSubtitlesQuotaExceededException $e) {
+                $this->assertStringNotContainsString('not retried locally', $e->getMessage());
+            }
+        }
+
+        $this->assertCount(2, $history, 'a stale (unparsable-window) reset must NOT block the network — honest retry');
+    }
+
+    public function test_header_value_reads_lists_and_scalars_case_insensitively(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'headerValue');
+        $method->setAccessible(true);
+
+        $this->assertSame('120', $method->invoke(null, ['Retry-After' => ['120']], 'retry-after'));
+        $this->assertSame('7', $method->invoke(null, ['x-thing' => '7'], 'X-THING'));
+        $this->assertNull($method->invoke(null, [], 'Retry-After'));
+        $this->assertNull($method->invoke(null, ['Retry-After' => []], 'Retry-After'));
+        $this->assertNull($method->invoke(null, ['Retry-After' => [null]], 'Retry-After'));
+    }
+
+    // ---------------------------------------------------------------------
     // Credential scoping (review osst__secaudit M05): the consumer key must
     // never ride to a response-supplied link host, and links must be HTTPS.
     // ---------------------------------------------------------------------
@@ -2041,21 +2214,35 @@ final class OpenSubtitlesProviderTest extends TestCase
     }
 
     /**
-     * @return array{status:int, body:string}
+     * Build a canned transport response. $headers, when given, is surfaced on
+     * the envelope's `headers` key (real responses carry PSR-7
+     * `array<string,list<string>>`; tests may pass scalar values for brevity —
+     * the provider's {@see headerValue()} reads both).
+     *
+     * @param array<string, string|list<string>> $headers
+     *
+     * @return array{status:int, body:string, headers?:array<string,string|list<string>>}
      */
-    private static function response(int $status, string $body): array
+    private static function response(int $status, string $body, array $headers = []): array
     {
-        return ['status' => $status, 'body' => $body];
+        $response = ['status' => $status, 'body' => $body];
+
+        if ($headers !== []) {
+            /** @var array<string, string|list<string>> $headers */
+            $response['headers'] = $headers;
+        }
+
+        return $response;
     }
 
     /**
      * Install a fake transport closure into the provider that records outgoing
-     * requests into $history and returns queued {status, body} responses.
+     * requests into $history and returns queued {status, body, headers?} responses.
      *
      * $history MUST be passed by reference — the closure binds it by reference
      * so requests appended during the call are visible to the caller afterwards.
      *
-     * @param list<array{status:int, body:string}>                                   $responses
+     * @param list<array{status:int, body:string, headers?:array<string,string|list<string>>}>      $responses
      * @param list<array{method:string, url:string, headers:array<string,string>, body:?string}> $history
      */
     private function installFakeTransport(OpenSubtitlesProvider $provider, array $responses, array &$history): void
