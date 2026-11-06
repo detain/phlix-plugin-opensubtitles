@@ -578,6 +578,53 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertCount(1, $history);
     }
 
+    /**
+     * A latched 429 window must refuse the next search LOCALLY before any dial
+     * is made — including the lazily-deferred login POST. Ordering the guard
+     * after ensureConnected() let a search whose login transiently failed
+     * re-dial POST /login inside a window the API had already declared dead.
+     */
+    public function test_search_refuses_locally_before_dialing_login_inside_rate_window(): void
+    {
+        $provider = new OpenSubtitlesProvider(
+            apiKey: self::TEST_API_KEY,
+            username: 'u',
+            password: 'p',
+        );
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            // First call: the login fails transiently (5xx un-latches the login
+            // flag), then the search itself is rate-limited and latches the
+            // window. A credentialed provider would otherwise re-dial /login on
+            // the next business call.
+            self::response(503, '{"message":"upstream unavailable"}'),
+            self::response(429, '{"message":"slow down"}', ['Retry-After' => '120']),
+            // Only a mis-ordered (guard-after-connect) second call consumes this.
+            self::response(503, '{"message":"upstream unavailable"}'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->searchByImdbIdRaw('tt1');
+            $this->fail('Expected the first search to surface the 429.');
+        } catch (OpenSubtitlesException $e) {
+            $this->assertStringContainsString('failed: HTTP 429', $e->getMessage());
+        }
+
+        $this->assertCount(2, $history, 'login plus the rate-limited search dial');
+
+        try {
+            $provider->searchByImdbIdRaw('tt2');
+            $this->fail('Expected the latched window to defer the second search.');
+        } catch (OpenSubtitlesException $e) {
+            $this->assertStringContainsString('rate-limited window', $e->getMessage());
+        }
+
+        $this->assertCount(2, $history, 'a deferred search must not dial login into the window');
+    }
+
     public function test_past_reset_time_never_latches_a_local_block(): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
@@ -1679,6 +1726,71 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->expectException(OpenSubtitlesException::class);
         $this->expectExceptionMessageMatches('/Download failed/');
         $provider->downloadRaw(998877);
+    }
+
+    /**
+     * The step-1 `POST download` must require a 2xx exactly like every other
+     * call. A non-2xx here (an unfollowed 3xx) is an honest status failure,
+     * never mis-reported as the generic "response did not include a download
+     * link" body error.
+     */
+    public function test_download_step1_rejects_a_non_2xx_status_as_a_status_failure(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(302, '{}'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->downloadRaw(998877);
+            $this->fail('Expected the 302 step-1 response to surface as a status failure.');
+        } catch (OpenSubtitlesException $e) {
+            $this->assertNotInstanceOf(OpenSubtitlesQuotaExceededException::class, $e);
+            $this->assertStringContainsString('Download failed', $e->getMessage());
+            $this->assertStringContainsString('HTTP 302', $e->getMessage());
+            $this->assertStringNotContainsString('did not include a download link', $e->getMessage());
+        }
+    }
+
+    /**
+     * The quota boundary must coerce a numeric-string `remaining` the way its
+     * sibling boundary helpers do, so a body reporting `"0"` is classified as
+     * exhausted (and latches the local window) instead of slipping past the
+     * int-only check into a malformed generic failure.
+     */
+    public function test_download_classifies_a_numeric_string_zero_remaining_as_quota(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $future = gmdate('Y-m-d\TH:i:s\Z', time() + 3600);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'remaining' => '0',
+                'reset_time_utc' => $future,
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->downloadRaw(1);
+            $this->fail('Expected numeric-string remaining:0 to classify as quota exhaustion.');
+        } catch (OpenSubtitlesQuotaExceededException $e) {
+            $this->assertSame(0, $e->downloadsRemaining);
+        }
+
+        try {
+            $provider->downloadRaw(2);
+            $this->fail('Expected the coerced 0 to have latched the quota window.');
+        } catch (OpenSubtitlesQuotaExceededException $e) {
+            $this->assertStringContainsString('not retried locally', $e->getMessage());
+        }
+
+        $this->assertCount(1, $history, 'a numeric-string remaining must latch the local window (no re-dial)');
     }
 
     // ---------------------------------------------------------------------
@@ -3687,6 +3799,45 @@ final class OpenSubtitlesProviderTest extends TestCase
                 'Tie order must be a total order — independent of input permutation.'
             );
         }
+    }
+
+    /**
+     * With downloads and rating tied, the `file_id` tie-break must order by
+     * integer value, not lexicographically: the docblock promises `file_id`
+     * ascending, so 99 precedes 100 (a string compare would invert them).
+     */
+    public function test_filter_subtitles_tie_break_orders_file_ids_numerically(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'filterSubtitles');
+        $method->setAccessible(true);
+
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $row = static function (string $id, int $fileId): array {
+            return [
+                'id' => $id,
+                'attributes' => [
+                    'language' => 'en',
+                    'download_count' => 500,
+                    'ratings' => 7.0,
+                    'files' => [['file_id' => $fileId, 'file_name' => $id . '.srt', 'cd_number' => 1]],
+                ],
+            ];
+        };
+
+        $raw = [
+            $row('a', 100),
+            $row('b', 99),
+            $row('c', 10),
+        ];
+
+        $result = $method->invoke($provider, $raw, 'srt');
+
+        $this->assertSame(
+            ['c', 'b', 'a'],
+            array_column($result, 'id'),
+            'file_id ascending as integers (10 < 99 < 100), not lexicographically.'
+        );
     }
 
     public function test_debug_info_redacts_credentials_and_keeps_benign_state_visible(): void

@@ -774,6 +774,12 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     public function searchByPath(string $path, array $languages): array
     {
         $this->ensureEnabled();
+
+        // Fail-fast on a latched rate window BEFORE any dial (login included),
+        // mirroring downloadRaw(): a deferred search must never re-post /login
+        // into a window the API already declared dead.
+        $this->guardSearchNotDeferred();
+
         $this->ensureConnected();
 
         $languageCsv = self::languageFilter($languages);
@@ -825,6 +831,12 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     public function searchByHash(string $movieHash, int $byteSize, array $languages): array
     {
         $this->ensureEnabled();
+
+        // Fail-fast on a latched rate window BEFORE any dial (login included),
+        // mirroring downloadRaw(): a deferred search must never re-post /login
+        // into a window the API already declared dead.
+        $this->guardSearchNotDeferred();
+
         $this->ensureConnected();
 
         $raw = $this->searchSubtitles(
@@ -858,6 +870,12 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     public function searchByImdbId(string $imdbId, array $languages): array
     {
         $this->ensureEnabled();
+
+        // Fail-fast on a latched rate window BEFORE any dial (login included),
+        // mirroring downloadRaw(): a deferred search must never re-post /login
+        // into a window the API already declared dead.
+        $this->guardSearchNotDeferred();
+
         $this->ensureConnected();
 
         $raw = $this->searchSubtitles(
@@ -941,7 +959,15 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * Low-level search for subtitles matching the given IMDB ID.
      *
      * @param string $imdbId         IMDB ID (e.g., "tt1234567").
-     * @param string $language       Language code (ISO 639-1).
+     * @param string $language       OpenSubtitles-domain language code, sent to
+     *                               the API VERBATIM. Unlike the contract search
+     *                               entries, this low-level `*Raw` call does not
+     *                               run the estate BCP-47 to provider alias
+     *                               mapping (see {@see languageFilter()} and
+     *                               {@see LANGUAGE_ALIASES}), so a caller passing
+     *                               an estate code such as `pt-BR` here gets the
+     *                               same silent-empty match the alias table
+     *                               exists to prevent.
      * @param string $subtitleFormat Preferred format (srt, sub, ass, etc.).
      *
      * @return list<array{
@@ -970,6 +996,12 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $subtitleFormat = $subtitleFormat ?: $this->format;
 
         $this->ensureEnabled();
+
+        // Fail-fast on a latched rate window BEFORE any dial (login included),
+        // mirroring downloadRaw(): a deferred search must never re-post /login
+        // into a window the API already declared dead.
+        $this->guardSearchNotDeferred();
+
         $this->ensureConnected();
 
         return $this->searchSubtitles([
@@ -990,7 +1022,15 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * respecting the OpenSubtitles download quota.
      *
      * @param string $filePath       Absolute path to the media file.
-     * @param string $language       Language code (ISO 639-1).
+     * @param string $language       OpenSubtitles-domain language code, sent to
+     *                               the API VERBATIM. Unlike the contract search
+     *                               entries, this low-level `*Raw` call does not
+     *                               run the estate BCP-47 to provider alias
+     *                               mapping (see {@see languageFilter()} and
+     *                               {@see LANGUAGE_ALIASES}), so a caller passing
+     *                               an estate code such as `pt-BR` here gets the
+     *                               same silent-empty match the alias table
+     *                               exists to prevent.
      * @param string $subtitleFormat Preferred format (srt, sub, ass, etc.).
      *
      * @return list<array{
@@ -1035,7 +1075,15 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * Low-level search for subtitles matching the given filename (fallback path).
      *
      * @param string $filename       Media filename.
-     * @param string $language       Language code (ISO 639-1).
+     * @param string $language       OpenSubtitles-domain language code, sent to
+     *                               the API VERBATIM. Unlike the contract search
+     *                               entries, this low-level `*Raw` call does not
+     *                               run the estate BCP-47 to provider alias
+     *                               mapping (see {@see languageFilter()} and
+     *                               {@see LANGUAGE_ALIASES}), so a caller passing
+     *                               an estate code such as `pt-BR` here gets the
+     *                               same silent-empty match the alias table
+     *                               exists to prevent.
      * @param string $subtitleFormat Preferred format (srt, sub, ass, etc.).
      *
      * @return list<array{
@@ -1064,6 +1112,12 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $subtitleFormat = $subtitleFormat ?: $this->format;
 
         $this->ensureEnabled();
+
+        // Fail-fast on a latched rate window BEFORE any dial (login included),
+        // mirroring downloadRaw(): a deferred search must never re-post /login
+        // into a window the API already declared dead.
+        $this->guardSearchNotDeferred();
+
         $this->ensureConnected();
 
         return $this->searchSubtitles(
@@ -1111,7 +1165,15 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *
      * @param string $hash           OpenSubtitles `moviehash` (see {@see computeMovieHash()}).
      * @param int    $size           File size in bytes.
-     * @param string $language       Language code (ISO 639-1).
+     * @param string $language       OpenSubtitles-domain language code, sent to
+     *                               the API VERBATIM. Unlike the contract search
+     *                               entries, this low-level `*Raw` call does not
+     *                               run the estate BCP-47 to provider alias
+     *                               mapping (see {@see languageFilter()} and
+     *                               {@see LANGUAGE_ALIASES}), so a caller passing
+     *                               an estate code such as `pt-BR` here gets the
+     *                               same silent-empty match the alias table
+     *                               exists to prevent.
      * @param string $subtitleFormat Preferred format (srt, sub, ass, etc.).
      *
      * @return list<array{
@@ -1140,6 +1202,12 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $subtitleFormat = $subtitleFormat ?: $this->format;
 
         $this->ensureEnabled();
+
+        // Fail-fast on a latched rate window BEFORE any dial (login included),
+        // mirroring downloadRaw(): a deferred search must never re-post /login
+        // into a window the API already declared dead.
+        $this->guardSearchNotDeferred();
+
         $this->ensureConnected();
 
         return $this->searchSubtitles([
@@ -1338,11 +1406,14 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $this->rememberQuotaWindow($data);
         $this->rememberRateWindow($linkResponse);
 
-        if ($linkResponse['status'] >= 400) {
+        // Require a 2xx exactly like every other call: an unfollowed 3xx or a
+        // 1xx is an honest status failure, never allowed to fall through to the
+        // body parsing below (where it would be mis-reported as "no link").
+        if ($linkResponse['status'] < 200 || $linkResponse['status'] >= 300) {
             throw $this->mapDownloadLinkFailure($linkResponse['status'], $data);
         }
 
-        $remaining = is_int($data['remaining'] ?? null) ? $data['remaining'] : null;
+        $remaining = self::intOrNull($data['remaining'] ?? null);
         $link = is_string($data['link'] ?? null) && $data['link'] !== '' ? $data['link'] : null;
 
         if ($link === null) {
@@ -1401,8 +1472,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     }
 
     /**
-     * Translate a 4xx failure from the step-1 `POST download` call into either a
-     * quota-specific exception or the generic download-failure exception.
+     * Translate a non-2xx failure from the step-1 `POST download` call into
+     * either a quota-specific exception or the generic download-failure exception.
      *
      * @param int                  $statusCode The HTTP status of the step-1 response.
      * @param array<string, mixed> $data       Decoded step-1 response body.
@@ -1422,7 +1493,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
                 $message,
                 resetTime: is_string($data['reset_time'] ?? null) ? $data['reset_time'] : null,
                 resetTimeUtc: is_string($data['reset_time_utc'] ?? null) ? $data['reset_time_utc'] : null,
-                downloadsRemaining: is_int($data['remaining'] ?? null) ? $data['remaining'] : null,
+                downloadsRemaining: self::intOrNull($data['remaining'] ?? null),
             );
         }
 
@@ -1452,7 +1523,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             $message,
             resetTime: is_string($data['reset_time'] ?? null) ? $data['reset_time'] : null,
             resetTimeUtc: is_string($data['reset_time_utc'] ?? null) ? $data['reset_time_utc'] : null,
-            downloadsRemaining: is_int($data['remaining'] ?? null) ? $data['remaining'] : null,
+            downloadsRemaining: self::intOrNull($data['remaining'] ?? null),
         );
     }
 
@@ -1748,8 +1819,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      */
     private function rememberQuotaWindow(array $data): void
     {
-        $remaining = $data['remaining'] ?? null;
-        if (!is_int($remaining) || $remaining !== 0) {
+        $remaining = self::intOrNull($data['remaining'] ?? null);
+        if ($remaining !== 0) {
             return;
         }
 
@@ -2044,9 +2115,12 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         }
 
         // Total order: download count descending, then rating descending
-        // (unrated last), then file_id ascending — so equal-download rows keep
-        // the same sequence across runs and PHP versions instead of inheriting
-        // usort's unstable tie order.
+        // (unrated last), then file_id ascending as INTEGERS — so rows the first
+        // two keys cannot separate keep one deterministic sequence regardless of
+        // input ordering. (PHP 8+ sorts are already stable, but an explicit
+        // integer final key makes this a true total order instead of an
+        // incidental one; a string cast here would tempt a future reader toward
+        // a lexicographic compare.)
         usort($results, static function (array $a, array $b): int {
             $byDownloads = $b['downloads'] <=> $a['downloads'];
             if ($byDownloads !== 0) {
@@ -2058,7 +2132,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
                 return $byRating;
             }
 
-            return (string) $a['file_id'] <=> (string) $b['file_id'];
+            return (int) $a['file_id'] <=> (int) $b['file_id'];
         });
 
         return $results;
@@ -2356,6 +2430,34 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         return match (true) {
             is_int($value) || is_float($value) => (float) $value,
             is_string($value) && is_numeric($value) => (float) $value,
+            default => null,
+        };
+    }
+
+    /**
+     * Coerce a raw API value to an int, or null when absent/non-integral.
+     *
+     * The real OpenSubtitles body carries the quota counters as JSON numbers,
+     * but the shared boundary-helper law (see {@see floatOrNull()} and
+     * {@see normalizeImdbId()}) is that a numeric string is a valid spelling of
+     * the same value — a body reporting `"0"` remaining means the same zero as
+     * `0`. Accepting only a PHP `int` would skip both the quota classification
+     * and the local window latch for the numeric-string spelling.
+     *
+     * Integers and integral strings (optional leading sign) coerce; a float, a
+     * fractional string, or anything else reads as null (no value).
+     *
+     * @param mixed $value Raw value.
+     *
+     * @return int|null
+     *
+     * @since 0.6.2
+     */
+    private static function intOrNull(mixed $value): ?int
+    {
+        return match (true) {
+            is_int($value) => $value,
+            is_string($value) && $value !== '' && preg_match('/^-?\d+$/', $value) === 1 => (int) $value,
             default => null,
         };
     }

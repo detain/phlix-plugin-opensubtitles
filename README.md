@@ -64,7 +64,11 @@ The plugin implements the `Phlix\Shared\Plugin\LifecycleInterface`, `Phlix\Share
 2. **Search** — queries subtitles by IMDB ID, filename, or `moviehash`. Each
    query returns the API **first page only** — result counts reflect that page,
    and the reported `meta.total_pages` is deliberately not followed; narrow the
-   query instead of paging.
+   query instead of paging. The contract search methods map estate BCP-47 codes
+   (`en-US`, `pt-BR`) into the OpenSubtitles language domain; the low-level
+   `*Raw` methods send the caller's language **verbatim**, so they expect
+   provider-domain codes (`en`, `pb`) and will silently match nothing if handed
+   an unmapped estate code.
 3. **Download — two steps** — `POST /download` with the file id consumes ONE
    quota unit and returns a temporary HTTPS link plus quota accounting; the
    plugin then fetches that link with a plain, **credential-free HTTPS GET**
