@@ -625,6 +625,140 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertCount(2, $history, 'a deferred search must not dial login into the window');
     }
 
+    /**
+     * The fail-fast-before-any-dial law is entry-generic, not raw-family-only:
+     * every public search entry — contract façade and low-level alike — must
+     * consult the latched rate window BEFORE ensureConnected() can re-post
+     * /login into a window the API already declared dead. One scenario per
+     * dialing entry; searchByPathRaw pins the delegation path — the delegate
+     * it reaches guards before that delegate's own dial.
+     *
+     * @dataProvider rateWindowSearchEntriesProvider
+     */
+    public function test_every_search_entry_refuses_locally_inside_rate_window(string $entry): void
+    {
+        $provider = $this->providerWithCredentials();
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            // First call: the login fails transiently (5xx un-latches the
+            // login flag), then the search itself is rate-limited and latches
+            // the window — the exact state a guard-after-connect entry leaks.
+            self::response(503, '{"message":"upstream unavailable"}'),
+            self::response(429, '{"message":"slow down"}', ['Retry-After' => '120']),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $this->invokeSearchEntry($provider, $entry);
+            $this->fail("Expected the first {$entry} call to surface the 429.");
+        } catch (OpenSubtitlesException $e) {
+            $this->assertStringContainsString('failed: HTTP 429', $e->getMessage());
+        }
+
+        $this->assertCount(2, $history, "{$entry} must dial login plus one search");
+
+        if ($entry === 'searchByPath' || $entry === 'searchByHash' || $entry === 'searchByImdbId') {
+            // Contract façades delegate to the raw family, so a deferred call
+            // surfaces the delegate's local refusal — possibly re-wrapped by
+            // the façade's own failure mapping. Either way zero bytes leave:
+            // install an EMPTY queue so any mis-ordered dial (a re-login
+            // ahead of the guard, most plausibly) fails loud in the fake.
+            $dialsAfterWindow = [];
+            $this->installFakeTransport($provider, [], $dialsAfterWindow);
+
+            try {
+                $this->invokeSearchEntry($provider, $entry);
+                $this->fail("Expected the latched window to defer the second {$entry} call.");
+            } catch (OpenSubtitlesException $e) {
+                $this->assertMatchesRegularExpression(
+                    '/rate-limited window|failed: HTTP 503/',
+                    $e->getMessage(),
+                    "{$entry} must refuse locally inside the window"
+                );
+            }
+
+            $this->assertCount(0, $dialsAfterWindow, "{$entry} must refuse before any dial (login included)");
+
+            return;
+        }
+
+        // Fresh transport with spare responses: had the raw entry dialed
+        // anything, the recorded history would show it instead of staying
+        // empty.
+        $dialsAfterWindow = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, '{"data":[]}'),
+            self::response(200, '{"data":[]}'),
+            self::response(200, '{"data":[]}'),
+        ], $dialsAfterWindow);
+
+        try {
+            $this->invokeSearchEntry($provider, $entry);
+            $this->fail("Expected the latched window to defer the second {$entry} call.");
+        } catch (OpenSubtitlesException $e) {
+            $this->assertStringContainsString('rate-limited window', $e->getMessage());
+        }
+
+        $this->assertCount(0, $dialsAfterWindow, "{$entry} must refuse before any dial (login included)");
+    }
+
+    /**
+     * @return array<string, array{0: string}>
+     */
+    public static function rateWindowSearchEntriesProvider(): array
+    {
+        $entries = [
+            'searchByPath',
+            'searchByHash',
+            'searchByImdbId',
+            'searchByImdbIdRaw',
+            'searchByPathRaw',
+            'searchByFilenameRaw',
+            'searchByHashRaw',
+        ];
+
+        return array_combine($entries, array_map(static fn (string $entry): array => [$entry], $entries));
+    }
+
+    /**
+     * One representative call per public search entry. The file path is
+     * deliberately absent so hash math falls back to a filename query and
+     * each entry performs exactly one search dial per call.
+     */
+    private function invokeSearchEntry(OpenSubtitlesProvider $provider, string $entry): void
+    {
+        $missingFile = '/tmp/opencode/w05L9-entry-law-absent.mkv';
+        $languages = ['en'];
+
+        switch ($entry) {
+            case 'searchByPath':
+                $provider->searchByPath($missingFile, $languages);
+                return;
+            case 'searchByHash':
+                $provider->searchByHash('0123456789abcdef', 1000, $languages);
+                return;
+            case 'searchByImdbId':
+                $provider->searchByImdbId('tt1', $languages);
+                return;
+            case 'searchByImdbIdRaw':
+                $provider->searchByImdbIdRaw('tt1');
+                return;
+            case 'searchByPathRaw':
+                $provider->searchByPathRaw($missingFile);
+                return;
+            case 'searchByFilenameRaw':
+                $provider->searchByFilenameRaw('movie.mkv');
+                return;
+            case 'searchByHashRaw':
+                $provider->searchByHashRaw('0123456789abcdef', 1000);
+                return;
+            default:
+                $this->fail("Unknown search entry {$entry}");
+        }
+    }
+
     public function test_past_reset_time_never_latches_a_local_block(): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
@@ -1791,6 +1925,41 @@ final class OpenSubtitlesProviderTest extends TestCase
         }
 
         $this->assertCount(1, $history, 'a numeric-string remaining must latch the local window (no re-dial)');
+    }
+
+    /**
+     * The quota-message mapper leg (non-2xx status + quota-flavoured message)
+     * must surface a numeric-string `remaining` through the same shared int
+     * coercion as every other consumer of the field: the API has serialized
+     * counts as strings on the wire, and a null display would hide the exact
+     * headroom the response reported.
+     */
+    public function test_download_quota_message_mapper_carries_numeric_string_remaining(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(429, (string) json_encode([
+                'message' => 'Daily download limit exceeded — quota exhausted for today',
+                'remaining' => '3',
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->downloadRaw(1);
+            $this->fail('Expected the quota-message mapper to classify the failure.');
+        } catch (OpenSubtitlesQuotaExceededException $e) {
+            $this->assertSame(
+                3,
+                $e->downloadsRemaining,
+                'a numeric-string remaining must ride the exception as an int'
+            );
+        }
+
+        $this->assertCount(1, $history, 'the 429 body is the step-1 failure; no further dial');
     }
 
     // ---------------------------------------------------------------------
