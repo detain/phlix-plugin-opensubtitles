@@ -13,7 +13,7 @@
             "default": null,
             "tier": "standard",
             "label": "OpenSubtitles API Key",
-            "description": "The API key for your OpenSubtitles.com consumer (API application). Required.",
+            "description": "The API key for your OpenSubtitles.com consumer (API application).",
             "link": "https://www.opensubtitles.com/en/consumers",
             "link_text": "OpenSubtitles API consumers"
         },

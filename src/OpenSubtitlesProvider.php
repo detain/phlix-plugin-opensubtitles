@@ -36,8 +36,10 @@ use Workerman\Http\Response;
  * ## Boot safety (Workerman/Webman resident memory)
  *
  * The host loads plugins into ~14 long-lived Workerman workers. Blocking I/O
- * in {@see onEnable()} at boot is the exact defect that caused the 2026-07-18
- * production revert, so this plugin is split into:
+ * in {@see onEnable()} at boot stalls that worker's event loop — every other
+ * resident task hangs until it returns, and a boot-time network round-trip
+ * across all workers can freeze the service, the defect that forced a
+ * production revert of exactly this pattern — so this plugin is split into:
  *
  * - {@see onEnable()} — the cheap "wire" step. Adopts the host logger and marks
  *   the provider enabled. It performs **NO network I/O and never logs in.**
@@ -469,8 +471,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *
      * Adopts the host logger and marks the provider enabled. It performs NO
      * network I/O and does NOT log in: at boot this runs across every worker,
-     * and blocking here is the item-5c3 landmine. Authentication is deferred to
-     * the first actual use via {@see ensureConnected()}.
+     * and blocking there would stall each worker's event loop for every other
+     * resident task (the boot-safety law in the class header). Authentication
+     * is deferred to the first actual use via {@see ensureConnected()}.
      *
      * @param ContainerInterface $container Host PSR-11 container.
      *
@@ -854,7 +857,11 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     /**
      * Contract search by IMDb id (MATCH_IMDB). Does NOT consume download quota.
      *
-     * @param string       $imdbId    IMDb id, with or without the `tt` prefix.
+     * @param string       $imdbId    IMDb id, with or without the `tt` prefix
+     *                                (case-insensitive, zero-padding to at
+     *                                least 7 digits is normalized for the
+     *                                query; malformed ids throw instead of
+     *                                silently matching nothing).
      * @param list<string> $languages ISO 639 / BCP-47-style codes to filter
      *                                (mapped to the OpenSubtitles language
      *                                domain; empty = no filter).
@@ -863,13 +870,21 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *                                  page only — see the searchSubtitles()
      *                                  pagination law).
      *
-     * @throws OpenSubtitlesException When the search transport/HTTP fails.
+     * @throws OpenSubtitlesException When the IMDb id is malformed, or the
+     *                                search transport/HTTP fails.
      *
      * @since 0.5.0
      */
     public function searchByImdbId(string $imdbId, array $languages): array
     {
         $this->ensureEnabled();
+
+        // The API matches the query verbatim, so the documented "with or
+        // without the tt prefix" acceptance is honored HERE, at the request
+        // boundary: canonicalize before anything dials, and refuse a value
+        // that is not an IMDb id in any spelling rather than let it return
+        // as a legitimate-looking empty search.
+        $imdbId = self::canonicalImdbId($imdbId);
 
         // Fail-fast on a latched rate window BEFORE any dial (login included),
         // mirroring downloadRaw(): a deferred search must never re-post /login
@@ -1291,7 +1306,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
 
         $data = json_decode($response['body'], true);
 
-        // Fail-vs-empty separation (review opensubtitles__srphp C2): `[]` is
+        // Fail-vs-empty separation: `[]` is
         // reserved for a parsed, valid, genuinely-empty `data` envelope. A 2xx
         // body that is not decodable JSON, or decodes without the expected
         // `data` list (gateway HTML page, truncated stream, error-in-200), is a
@@ -1557,6 +1572,14 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * Only genuine transport failures (connection/timeout) and over-cap
      * response bodies throw; see {@see MAX_RESPONSE_BYTES}.
      *
+     * Redirects are refused outright: the options pin `allow_redirects.max`
+     * to 0, so the vendored client hands any 3xx straight back here instead
+     * of following it, and the caller's own status band rejects it as an
+     * explicit HTTP failure. This is what makes the credential-custody law
+     * ({@see isApiOrigin()}) true on the wire — a followed redirect would
+     * replay these very options, headers with the Api-Key and session token
+     * included, to whatever host the response's Location names.
+     *
      * @param string                $method  HTTP method.
      * @param string                $url     Absolute URL (or a path relative to API_BASE).
      * @param array<string, string> $headers Request headers.
@@ -1592,6 +1615,14 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $options = [
             'method' => $method,
             'headers' => $headers,
+            // Never follow a redirect: the vendor default (max 5) would
+            // re-issue these options — headers with the Api-Key and session
+            // token included — to the Location host, defeating the
+            // credential scoping below with an attacker-chosen (or merely
+            // misconfigured) hop. At max 0 the client hands the 3xx straight
+            // to the success callback and each caller's status band refuses
+            // it. Pinned by the redirect-refusal tests.
+            'allow_redirects' => ['max' => 0],
             // Abort mid-flight once the cap is crossed: throwing here rides
             // the client's error path, which closes the connection and
             // records $state['error'] — an over-cap body is never delivered.
@@ -1699,6 +1730,11 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * but never credentials — closing the credential-exfiltration-by-response
      * vector where a single malformed or malicious link value would otherwise
      * ship the long-lived consumer key cross-origin.
+     *
+     * The claim covers the sent request; it survives 3xx responses only
+     * because redirects are refused outright at the transport
+     * (`allow_redirects` max 0 in {@see httpRequest()}) — a followed hop
+     * would replay these headers to whatever host the response names.
      */
     private static function isApiOrigin(string $url): bool
     {
@@ -2183,7 +2219,44 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             return null;
         }
 
-        return 'tt' . str_pad((string) $number, 7, '0', STR_PAD_LEFT);
+        return self::padImdbIdDigits((string) $number);
+    }
+
+    /**
+     * The single IMDb-id padding rule — digits in, `tt` + at least 7 digits
+     * out — shared by the request boundary ({@see canonicalImdbId()}) and
+     * the response parser ({@see normalizeImdbId()}).
+     */
+    private static function padImdbIdDigits(string $digits): string
+    {
+        return 'tt' . str_pad($digits, 7, '0', STR_PAD_LEFT);
+    }
+
+    /**
+     * Canonicalize a caller-supplied IMDb id to the API query form: a digit
+     * run with an optional `tt` prefix (either case), zero-padded to at
+     * least 7 digits. Request-boundary twin of {@see normalizeImdbId()} —
+     * that one soft-parses the API's own values (null on non-numeric),
+     * while this one guards what the plugin sends: an id outside the
+     * grammar fails loud instead of round-tripping as a silent-empty
+     * search whose empty result callers would cache as truth.
+     *
+     * @throws OpenSubtitlesException When `$imdbId` is not digits with an
+     *                                optional `tt` prefix.
+     *
+     * @since 0.6.1
+     */
+    private static function canonicalImdbId(string $imdbId): string
+    {
+        $trimmed = trim($imdbId);
+
+        if (preg_match('/^(?:tt)?([0-9]+)$/i', $trimmed, $matches) === 1) {
+            return self::padImdbIdDigits($matches[1]);
+        }
+
+        throw new OpenSubtitlesException(
+            "Invalid IMDb id '{$imdbId}': expected digits with an optional 'tt' prefix (e.g. '133093' or 'tt0133093')",
+        );
     }
 
     /**

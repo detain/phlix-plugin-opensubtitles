@@ -1184,6 +1184,82 @@ final class OpenSubtitlesProviderTest extends TestCase
     }
 
     /**
+     * The shared contract — and this class's own docblock — promise an IMDb id
+     * "with or without the `tt` prefix". The API matches the query verbatim,
+     * so a bare number must be canonicalized at the request boundary: left
+     * unprefixed it silently matches nothing, and callers cache that empty
+     * result as a genuine miss.
+     *
+     * @dataProvider imdbIdCanonicalizationProvider
+     */
+    public function test_search_by_imdb_id_normalizes_every_valid_spelling_to_the_canonical_query(string $input, string $canonical): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [self::response(200, '{"data":[]}')], $history);
+
+        $provider->onEnable($this->stubContainer());
+        $provider->searchByImdbId($input, []);
+
+        $this->assertCount(1, $history);
+        $this->assertStringContainsString("imdb_id={$canonical}", $history[0]['url']);
+    }
+
+    /** @return array<string, array{0: string, 1: string}> */
+    public static function imdbIdCanonicalizationProvider(): array
+    {
+        return [
+            'bare number gains the prefix and padding' => ['133093', 'tt0133093'],
+            'short prefixed id pads' => ['tt133093', 'tt0133093'],
+            'uppercase prefix normalizes' => ['TT133093', 'tt0133093'],
+            'canonical id passes through untouched' => ['tt0133093', 'tt0133093'],
+            'surrounding whitespace trims' => [' 133093 ', 'tt0133093'],
+            'eight digits stay intact' => ['tt12345678', 'tt12345678'],
+        ];
+    }
+
+    /**
+     * A value that is not a digit run with an optional `tt` prefix is not an
+     * IMDb id in any spelling: it must fail loud at the plugin boundary,
+     * before any dial, instead of round-tripping the API as a silent-empty
+     * match or an opaque 400.
+     *
+     * @dataProvider malformedImdbIdProvider
+     */
+    public function test_search_by_imdb_id_rejects_malformed_id_without_dialing(string $input): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [self::response(200, '{"data":[]}')], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $thrown = null;
+        try {
+            $provider->searchByImdbId($input, []);
+        } catch (OpenSubtitlesException $e) {
+            $thrown = $e;
+        }
+
+        $this->assertNotNull($thrown, "malformed id '{$input}' must throw OpenSubtitlesException");
+        $this->assertStringContainsString('Invalid IMDb id', $thrown->getMessage());
+        $this->assertSame([], $history, 'a malformed id must never reach the wire');
+    }
+
+    /** @return array<string, array{0: string}> */
+    public static function malformedImdbIdProvider(): array
+    {
+        return [
+            'letters' => ['banana'],
+            'name id (wrong entity kind)' => ['nm0000123'],
+            'prefix without digits' => ['tt'],
+            'mixed tail' => ['tt12a34'],
+            'empty string' => [''],
+            'whitespace only' => ['   '],
+        ];
+    }
+
+    /**
      * The hash search must send BOTH the `moviehash` and the file size
      * (`moviebytesize`). Mutating the query to drop the size, or to send the
      * weak filename query instead, must fail this.
@@ -2972,6 +3048,205 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertCount(1, $clients);
         $this->assertArrayHasKey('api.opensubtitles.com', $clients);
         $this->assertInstanceOf(\Workerman\Http\Client::class, $clients['api.opensubtitles.com']);
+    }
+
+    // ---------------------------------------------------------------------
+    // Redirect refusal — a response-named Location must never be dialed with
+    // the Api-Key / Bearer headers riding along. The credential-custody law
+    // of isApiOrigin() (the API origin is the ONLY host that ever sees the
+    // consumer key or session token) holds on the wire only because
+    // redirects are refused, not because a TLS accident blocks them.
+    // ---------------------------------------------------------------------
+
+    /**
+     * Options-layer pin the seam cannot see: the vendored wire client
+     * defaults to following up to five redirects and replays the original
+     * request options — `headers` included — to each Location host. The
+     * options array httpRequest() hands that client must therefore carry an
+     * explicit `allow_redirects` max of 0 (Request::redirect() checks the
+     * budget before queueing any follow-up dial).
+     */
+    public function test_http_request_options_disable_redirects_on_the_wire_client(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $provider->onEnable($this->stubContainer());
+
+        $recorder = $this->installRecordingHttpClient($provider);
+        $recorder->pending[] = new \Workerman\Http\Response(200, [], '{"data":[]}');
+
+        $provider->searchByImdbIdRaw('tt1234567');
+
+        $this->assertCount(1, $recorder->dials);
+        $options = $recorder->dials[0]['options'];
+        $this->assertArrayHasKey(
+            'allow_redirects',
+            $options,
+            'the redirect policy must be explicit on every request, never the vendor default',
+        );
+        $this->assertSame(['max' => 0], $options['allow_redirects']);
+    }
+
+    /**
+     * Wire-path companion: with the seam bypassed, a 302 delivered by the
+     * real-client code path must reach the caller's status band as an
+     * explicit failure and produce no second dial — proving the refusal
+     * end-to-end through the production options-building path.
+     */
+    public function test_redirect_delivered_by_the_wire_client_surfaces_as_explicit_failure(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $provider->onEnable($this->stubContainer());
+
+        $recorder = $this->installRecordingHttpClient($provider);
+        $recorder->pending[] = new \Workerman\Http\Response(302, ['Location' => 'https://credential-thief.example/']);
+
+        $thrown = null;
+        try {
+            $provider->searchByImdbIdRaw('tt1234567');
+        } catch (OpenSubtitlesException $e) {
+            $thrown = $e;
+        }
+
+        $this->assertNotNull($thrown, 'a 302 must fail loud, never be treated as a successful search');
+        $this->assertStringContainsString('HTTP 302', $thrown->getMessage());
+        $this->assertCount(1, $recorder->dials, 'no second dial after a refused redirect');
+    }
+
+    /**
+     * Seam-layer law: a 302 plus Location on the search leg must surface as
+     * an explicit status failure and never produce a follow-up dial — the
+     * fake transport's queue is deliberately exhausted, so any attempt at a
+     * second request would throw from inside the seam itself.
+     */
+    public function test_search_refuses_a_redirect_without_dialing_the_location_target(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(302, '', ['Location' => 'https://credential-thief.example/redirect']),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $thrown = null;
+        try {
+            $provider->searchByImdbIdRaw('tt1234567');
+        } catch (OpenSubtitlesException $e) {
+            $thrown = $e;
+        }
+
+        $this->assertNotNull($thrown);
+        $this->assertStringContainsString('HTTP 302', $thrown->getMessage());
+        $this->assertCount(1, $history);
+        $this->assertStringNotContainsString('credential-thief.example', $history[0]['url']);
+    }
+
+    /**
+     * Step-1 of the two-step download: a 302 from `POST download` must be
+     * refused at the status band — not followed, and not escalated into the
+     * quota-consuming link fetch, which has no link to fetch.
+     */
+    public function test_download_step1_redirect_is_refused_and_no_link_leg_is_dialed(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(302, '', ['Location' => 'https://credential-thief.example/redirect']),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $thrown = null;
+        try {
+            $provider->downloadRaw(998877);
+        } catch (OpenSubtitlesException $e) {
+            $thrown = $e;
+        }
+
+        $this->assertNotNull($thrown);
+        $this->assertStringContainsString('HTTP 302', $thrown->getMessage());
+        $this->assertCount(1, $history, 'the refused response must not be followed, retried, or escalated to a link fetch');
+    }
+
+    /**
+     * Step-2 link leg: the download-link host is response-supplied; its 302
+     * must die at the status band instead of dialing an attacker-chosen
+     * target (the multi-hop amplification the auditor flagged).
+     */
+    public function test_download_link_redirect_is_refused_without_dialing_the_location_target(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'link' => 'https://dl.example.com/sub/998877.srt',
+                'file_name' => 'movie.srt',
+                'remaining' => 5,
+            ])),
+            self::response(302, '', ['Location' => 'https://credential-thief.example/redirect']),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $thrown = null;
+        try {
+            $provider->downloadRaw(998877);
+        } catch (OpenSubtitlesException $e) {
+            $thrown = $e;
+        }
+
+        $this->assertNotNull($thrown);
+        $this->assertStringContainsString('HTTP 302', $thrown->getMessage());
+        $this->assertCount(2, $history, 'exactly the two sanctioned legs — the Location target must never be dialed');
+        foreach ($history as $dial) {
+            $this->assertStringNotContainsString('credential-thief.example', $dial['url']);
+        }
+    }
+
+    /**
+     * Replace the provider's per-host wire clients with a recording double
+     * for the API origin. The double overrides request() — the single entry
+     * point httpRequest() dials through — records the complete options
+     * array, and delivers queued canned responses synchronously, so the
+     * cooperative-wait loop never sleeps and no socket is ever opened.
+     *
+     * @return object{dials: list<array{url: string, options: array<string, mixed>}>, pending: list<\Workerman\Http\Response|\Throwable>}
+     */
+    private function installRecordingHttpClient(OpenSubtitlesProvider $provider): object
+    {
+        $recorder = new class extends \Workerman\Http\Client {
+            /** @var list<array{url: string, options: array<string, mixed>}> */
+            public array $dials = [];
+
+            /** @var list<\Workerman\Http\Response|\Throwable> */
+            public array $pending = [];
+
+            /** Skips the parent constructor on purpose: no pool, no event loop. */
+            public function __construct(array $options = [])
+            {
+            }
+
+            public function request(string $url, array $options = []): mixed
+            {
+                $this->dials[] = ['url' => $url, 'options' => $options];
+
+                $next = array_shift($this->pending);
+
+                if ($next instanceof \Throwable) {
+                    $options['error']($next);
+                } elseif ($next !== null) {
+                    $options['success']($next);
+                }
+
+                return null;
+            }
+        };
+
+        $prop = new \ReflectionProperty(OpenSubtitlesProvider::class, 'httpClients');
+        $prop->setAccessible(true);
+        $prop->setValue($provider, ['api.opensubtitles.com' => $recorder]);
+
+        return $recorder;
     }
 
     // ---------------------------------------------------------------------

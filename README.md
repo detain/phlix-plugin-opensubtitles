@@ -116,7 +116,7 @@ API references: [REST API docs](https://www.opensubtitles.com/en/doc/apis) ·
 ## Development
 
 Setup (PHP >= 8.3). `composer.lock` is committed on purpose — CI audits
-exactly those pinned versions (the S440 security-audit gate reads the
+exactly those pinned versions (the S246 security-audit gate reads the
 tracked lock), so install from it rather than re-resolving:
 
     composer install
