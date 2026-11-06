@@ -40,7 +40,7 @@
             "default": "en",
             "tier": "advanced",
             "label": "Subtitle language",
-            "description": "Preferred subtitle language as an ISO 639-1 code (e.g. en, es, fr). Optional; default en."
+            "description": "Preferred subtitle language as an ISO 639-1 code (e.g. en, es, fr). Region-tagged BCP-47 codes are accepted on the contract searches and normalized into the provider domain (pt-BR → pb, en-US → en); the low-level raw searches send this value verbatim. Optional; default en."
         },
         "format": {
             "type": "string",

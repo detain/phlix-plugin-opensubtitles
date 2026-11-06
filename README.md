@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/detain/phlix-plugin-opensubtitles/actions/workflows/test.yml/badge.svg)](https://github.com/detain/phlix-plugin-opensubtitles/actions/workflows/test.yml)
 
-> OpenSubtitles **subtitle-provider** plugin for [Phlix](https://github.com/detain/phlix)
+> OpenSubtitles **subtitle-provider** plugin for [Phlix](https://github.com/detain/phlix-server)
 > — search and download subtitles for movies and TV shows via the OpenSubtitles REST API.
 
 ## What it does
@@ -10,7 +10,7 @@
 This plugin integrates [OpenSubtitles](https://www.opensubtitles.com/) into the Phlix subtitle pipeline. It allows searching for subtitles by:
 
 - **IMDB ID** — find subtitles for a specific movie/TV show
-- **Filename** — extract media info from a filename and search matching subtitles
+- **Filename** — search subtitles by a media filename (its name stem is the search keyword; an embedded `tt…` IMDb id is used as an IMDB-ID lookup)
 - **File hash** — match subtitles using the OpenSubtitles `moviehash` algorithm
 
 ## Install
@@ -22,7 +22,7 @@ The plugin is unsigned by design. Install via the Phlix admin UI:
 3. Paste this URL into the **Install from URL** form and submit:
 
    ```
-   https://raw.githubusercontent.com/detain/phlix-plugin-opensubtitles/main/plugin.json
+   https://raw.githubusercontent.com/detain/phlix-plugin-opensubtitles/master/plugin.json
    ```
 
 4. Configure your OpenSubtitles API key in the plugin settings.
@@ -36,7 +36,7 @@ Configure these in the Phlix admin **Plugins → Configure** dialog.
 | `api_key`    | **Yes**  | yes    | —       | API key for your OpenSubtitles.com consumer (API application). |
 | `username`   | No       | —      | —       | OpenSubtitles.com username. Raises download limits (VIP limits for VIP accounts). |
 | `password`   | No       | yes    | —       | OpenSubtitles.com password. Only used with the username. |
-| `language`   | No       | —      | `en`    | Default subtitle language (ISO 639-1, e.g. en, es, fr). |
+| `language`   | No       | —      | `en`    | Default subtitle language (ISO 639-1, e.g. en, es, fr; region-tagged BCP-47 codes are accepted and normalized — `pt-BR` maps to the provider's legacy `pb`, other region subtags are stripped, e.g. `en-US` → `en`). |
 | `format`     | No       | —      | `srt`   | Preferred subtitle format (srt, sub, ass, etc.). |
 | `priority`   | No       | —      | `10`    | Ranking weight for this subtitle source relative to others. Lower runs first (0 = highest priority); admins can override the effective order via the server subtitle-provider priority list. |
 

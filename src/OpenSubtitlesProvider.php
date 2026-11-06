@@ -1661,7 +1661,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *
      * @return string
      *
-     * @since 0.6.1
+     * @since 0.6.0
      */
     private static function responseCapExceededMessage(): string
     {
@@ -1680,7 +1680,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *
      * @throws OpenSubtitlesException When the body exceeds the cap.
      *
-     * @since 0.6.1
+     * @since 0.6.0
      */
     private static function assertWithinResponseCap(array $response): array
     {
@@ -2451,7 +2451,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *
      * @return int|null
      *
-     * @since 0.6.2
+     * @since 0.6.1
      */
     private static function intOrNull(mixed $value): ?int
     {
