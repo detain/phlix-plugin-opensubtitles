@@ -100,6 +100,56 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertSame('srt', $provider->getFormat());
     }
 
+    /**
+     * The manifest declares api_key required, and every authenticated round
+     * trip without one dies in a 401. A keyless enable must therefore fail
+     * fast at the call boundary with a named cause instead of performing an
+     * uncredentialed request per call.
+     */
+    public function test_empty_api_key_fails_fast_before_any_search_dial(): void
+    {
+        $provider = new OpenSubtitlesProvider();
+        $provider->configure(['language' => 'en', 'format' => 'srt']);
+
+        $history = [];
+        $this->installFakeTransport($provider, [self::response(200, '{"data":[]}')], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $thrown = null;
+        try {
+            $provider->searchByImdbId('133093', []);
+        } catch (OpenSubtitlesException $e) {
+            $thrown = $e;
+        }
+
+        $this->assertNotNull($thrown, 'a keyless provider must refuse authenticated calls');
+        $this->assertStringContainsString('api_key', $thrown->getMessage(), 'the message must name the setting');
+        $this->assertSame([], $history, 'the fail-fast must not consume the wire');
+    }
+
+    public function test_empty_api_key_fails_fast_before_any_download_dial(): void
+    {
+        $provider = new OpenSubtitlesProvider();
+        $provider->configure([]);
+
+        $history = [];
+        $this->installFakeTransport($provider, [], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $thrown = null;
+        try {
+            $provider->downloadRaw(42);
+        } catch (OpenSubtitlesException $e) {
+            $thrown = $e;
+        }
+
+        $this->assertNotNull($thrown, 'a keyless provider must refuse downloads');
+        $this->assertStringContainsString('api_key', $thrown->getMessage());
+        $this->assertSame([], $history, 'the fail-fast must not consume the wire');
+    }
+
     // ---------------------------------------------------------------------
     // Boot safety: onEnable must not do HTTP / must not log in
     // ---------------------------------------------------------------------
@@ -261,7 +311,7 @@ final class OpenSubtitlesProviderTest extends TestCase
             self::response(200, (string) json_encode(['token' => 'session-token-123'])),
             self::response(200, '{"data":[]}'),
             self::response(200, (string) json_encode([
-                'link' => 'https://dl.example-cdn.org/f.srt',
+                'link' => 'https://dl.opensubtitles.org/f.srt',
                 'remaining' => 5,
             ])),
             self::response(200, "1\n00:00:01,000 --> 00:00:02,000\nhi\n"),
@@ -372,7 +422,7 @@ final class OpenSubtitlesProviderTest extends TestCase
             self::response(401, '{"message":"session revoked"}'),
             self::response(200, '{"token":"tok-b"}'),
             self::response(200, (string) json_encode([
-                'link' => 'https://dl.example-cdn.org/f.srt',
+                'link' => 'https://dl.opensubtitles.org/f.srt',
                 'remaining' => 5,
                 'file_name' => 'movie.srt',
             ])),
@@ -499,7 +549,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $history = [];
         $this->installFakeTransport($provider, [
             self::response(200, (string) json_encode([
-                'link' => 'https://dl.example-cdn.org/f.srt',
+                'link' => 'https://dl.opensubtitles.org/f.srt',
                 'file_name' => 'f.srt',
                 'remaining' => 0,
                 'reset_time_utc' => $future,
@@ -817,7 +867,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->installFakeTransport($provider, [
             self::response(200, (string) json_encode(['token' => 'tok'])),
             self::response(200, (string) json_encode([
-                'link' => 'https://dl.example-cdn.org/download/src/upload/9.srt',
+                'link' => 'https://dl.opensubtitles.org/download/src/upload/9.srt',
                 'file_name' => '9.srt',
                 'remaining' => 5,
             ])),
@@ -1161,6 +1211,70 @@ final class OpenSubtitlesProviderTest extends TestCase
         (new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY))->downloadRaw(12345);
     }
 
+    /**
+     * Only ids this plugin minted are guaranteed positive (mapCandidates drops
+     * non-positive file ids); a zero or negative id reaching downloadRaw is
+     * the residue of casting malformed or mutated input, and POSTing it would
+     * spend a quota-metered call on a guaranteed miss. Refuse it locally.
+     *
+     * @dataProvider nonPositiveFileIdProvider
+     */
+    public function test_download_raw_refuses_non_positive_file_id_without_dialing(int $fileId): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $thrown = null;
+        try {
+            $provider->downloadRaw($fileId);
+        } catch (OpenSubtitlesException $e) {
+            $thrown = $e;
+        }
+
+        $this->assertNotNull($thrown, "file id {$fileId} must be refused");
+        $this->assertStringContainsString('positive integer', $thrown->getMessage());
+        $this->assertStringContainsString((string) $fileId, $thrown->getMessage(), 'the message names the bad id');
+        $this->assertSame([], $history, 'the refusal must not consume the wire');
+    }
+
+    /** @return array<string, array{0: int}> */
+    public static function nonPositiveFileIdProvider(): array
+    {
+        return [
+            'zero (cast residue of a non-numeric id)' => [0],
+            'negative' => [-7],
+        ];
+    }
+
+    /**
+     * The contract entry casts the candidate's string download id; a
+     * non-numeric value becomes 0 and must hit the same local refusal.
+     */
+    public function test_download_refuses_candidate_with_non_numeric_download_id(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $candidate = self::candidate('not-a-number', 'en', 'srt', 'Movie.2019');
+
+        $thrown = null;
+        try {
+            $provider->download($candidate);
+        } catch (OpenSubtitlesException $e) {
+            $thrown = $e;
+        }
+
+        $this->assertNotNull($thrown, 'a non-numeric download id must throw');
+        $this->assertStringContainsString('positive integer', $thrown->getMessage());
+        $this->assertSame([], $history, 'the refusal must not consume the wire');
+    }
+
     // ---------------------------------------------------------------------
     // Search request shape
     // ---------------------------------------------------------------------
@@ -1257,6 +1371,67 @@ final class OpenSubtitlesProviderTest extends TestCase
             'empty string' => [''],
             'whitespace only' => ['   '],
         ];
+    }
+
+    /**
+     * The malformed-id message quotes the caller's input, so the rendered
+     * excerpt must be flattened and bounded: an embedded newline must not
+     * forge extra log lines downstream (the message is logged verbatim on the
+     * search and download paths), and a megabyte-long id must not pad the
+     * message unboundedly.
+     */
+    public function test_malformed_imdb_id_message_carries_no_injected_newlines(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $thrown = null;
+        try {
+            $provider->searchByImdbId("banana\n[ERROR] forged log line", []);
+        } catch (OpenSubtitlesException $e) {
+            $thrown = $e;
+        }
+
+        $this->assertNotNull($thrown, 'the malformed id must throw');
+        $this->assertStringNotContainsString(
+            "\n",
+            $thrown->getMessage(),
+            'raw caller newlines must never survive into the message',
+        );
+        $this->assertStringContainsString(
+            'banana [ERROR] forged log line',
+            $thrown->getMessage(),
+            'the collapsed excerpt must stay identifiable',
+        );
+        $this->assertSame([], $history);
+    }
+
+    public function test_malformed_imdb_id_message_bounds_the_excerpt_length(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $thrown = null;
+        try {
+            $provider->searchByImdbId(str_repeat('x', 5_000) . '!', []);
+        } catch (OpenSubtitlesException $e) {
+            $thrown = $e;
+        }
+
+        $this->assertNotNull($thrown, 'the malformed id must throw');
+        $this->assertStringNotContainsString(
+            str_repeat('x', 65),
+            $thrown->getMessage(),
+            'the quoted excerpt must be truncated',
+        );
+        $this->assertLessThan(250, strlen($thrown->getMessage()), 'the message must stay bounded');
+        $this->assertSame([], $history);
     }
 
     /**
@@ -2082,7 +2257,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         // Over-cap must surface the documented HTTP-failure envelope wrapped
         // as 'Download failed: ...' — never a partial success, never [].
         $this->expectException(OpenSubtitlesException::class);
-        $this->expectExceptionMessageMatches('/Download failed: HTTP response exceeded the \d+-byte cap/');
+        $this->expectExceptionMessageMatches('/Download failed: HTTP response exceeded the 10 MiB cap/');
         $provider->downloadRaw(998877);
     }
 
@@ -2117,7 +2292,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $provider->onEnable($this->stubContainer());
 
         $this->expectException(OpenSubtitlesException::class);
-        $this->expectExceptionMessageMatches('/Search by IMDB ID failed: HTTP response exceeded the \d+-byte cap/');
+        $this->expectExceptionMessageMatches('/Search by IMDB ID failed: HTTP response exceeded the 10 MiB cap/');
         $provider->searchByImdbIdRaw('tt1234567');
     }
 
@@ -2973,6 +3148,14 @@ final class OpenSubtitlesProviderTest extends TestCase
             'empty provider name no release uses default' => ['', null, 'en', 'srt', 'subtitle.en.srt'],
             'only extension provider name' => ['.', null, 'en', 'srt', 'subtitle.en.srt'],
             'release name with year treated as extension' => ['', 'Great.Movie.1999', 'fr', 'ass', 'Great.Movie.ass'],
+            // The parent-directory token is the one value that escapes a joined
+            // path; it must hit the fallback, and the fallback must share the
+            // provider branch's scrub of control chars, slashes and backslashes.
+            'parent token provider name falls back' => ['..', null, 'en', 'srt', 'subtitle.en.srt'],
+            'provider name scrubbing into parent token falls back' => ["\x01..", null, '', '', 'subtitle.srt'],
+            'traversal in configured format scrubbed' => ['', 'Movie', 'en', 'srt/../x', 'Movie.srt..x'],
+            'control and slash in configured language scrubbed' => ['', null, "en\n/x", 'srt', 'subtitle.enx.srt'],
+            'degenerate composition hits the final guard' => ['', "\x01", '', '.', 'subtitle.srt'],
         ];
     }
 
@@ -3179,7 +3362,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $history = [];
         $this->installFakeTransport($provider, [
             self::response(200, (string) json_encode([
-                'link' => 'https://dl.example.com/sub/998877.srt',
+                'link' => 'https://dl.opensubtitles.org/sub/998877.srt',
                 'file_name' => 'movie.srt',
                 'remaining' => 5,
             ])),
@@ -3200,6 +3383,80 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertCount(2, $history, 'exactly the two sanctioned legs — the Location target must never be dialed');
         foreach ($history as $dial) {
             $this->assertStringNotContainsString('credential-thief.example', $dial['url']);
+        }
+    }
+
+    /**
+     * The step-2 link is response-supplied. Only hosts inside the
+     * OpenSubtitles domain family may be dialed: anything else turns a
+     * compromised upstream (or account) into a server-side request forgery
+     * primitive against arbitrary HTTPS endpoints the resident worker can
+     * reach. The refusal happens after step 1 (the quota POST) and before
+     * any second dial.
+     *
+     * @dataProvider untrustedDownloadLinkProvider
+     */
+    public function test_download_link_outside_the_trust_domain_is_refused_without_dialing(string $link): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode(['link' => $link, 'file_name' => 'movie.srt'])),
+            self::response(200, 'subtitle body'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $thrown = null;
+        try {
+            $provider->downloadRaw(998877);
+        } catch (OpenSubtitlesException $e) {
+            $thrown = $e;
+        }
+
+        $this->assertNotNull($thrown, "link '{$link}' must be refused");
+        $this->assertStringContainsString('trust domain', $thrown->getMessage());
+        $this->assertCount(1, $history, 'only the step-1 POST happens; the untrusted link must never be dialed');
+    }
+
+    /** @return array<string, array{0: string}> */
+    public static function untrustedDownloadLinkProvider(): array
+    {
+        return [
+            'foreign host' => ['https://evil.example/internal/secret.srt'],
+            'private-network literal' => ['https://127.0.0.1:9200/_search'],
+            'suffix spoof past the domain boundary' => ['https://opensubtitles.com.attacker.example/x.srt'],
+            'prefix spoof' => ['https://evil-opensubtitles.com/x.srt'],
+            'non-443 port on a trusted host' => ['https://dl.opensubtitles.org:8443/admin'],
+        ];
+    }
+
+    /**
+     * Positive legs of the same gate: hosts inside both family apexes (the
+     * API's own CDN names) must still be fetched, with and without the
+     * explicit default port.
+     */
+    public function test_download_links_inside_the_trust_domain_are_fetched(): void
+    {
+        $links = [
+            'https://dl.opensubtitles.org/download/src/upload/7.srt',
+            'https://www.opensubtitles.com/en/download/sub/123',
+            'https://dl.opensubtitles.org:443/download/src/upload/7.srt',
+        ];
+
+        foreach ($links as $index => $link) {
+            $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+            $history = [];
+            $this->installFakeTransport($provider, [
+                self::response(200, (string) json_encode(['link' => $link, 'file_name' => 'movie.srt'])),
+                self::response(200, "body-{$index}"),
+            ], $history);
+
+            $provider->onEnable($this->stubContainer());
+            $download = $provider->downloadRaw(998877);
+
+            $this->assertSame("body-{$index}", $download->content, "trusted link '{$link}' must be fetched");
+            $this->assertSame($link, $history[1]['url']);
         }
     }
 
@@ -3357,7 +3614,7 @@ final class OpenSubtitlesProviderTest extends TestCase
             $callCount++;
             if ($callCount === 1) {
                 return ['status' => 200, 'body' => json_encode([
-                    'link' => 'https://example.com/file.srt',
+                    'link' => 'https://dl.opensubtitles.org/file.srt',
                     'file_name' => 'test.srt',
                 ])];
             }

@@ -128,6 +128,18 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     private const API_BASE = 'https://' . self::API_HOST . '/api/v1/';
 
     /**
+     * Apex domains whose hosts the response-supplied step-2 download link is
+     * allowed to name. The OpenSubtitles family serves download links from
+     * both apexes (`dl.opensubtitles.org`, `www.opensubtitles.com`) and the
+     * set is closed — a link naming any other host is refused ({@see
+     * isTrustedDownloadLink()}) so a compromised upstream or account cannot
+     * turn this resident worker into a proxy for arbitrary HTTPS endpoints.
+     *
+     * @var list<string>
+     */
+    private const DOWNLOAD_LINK_TRUST_DOMAINS = ['opensubtitles.com', 'opensubtitles.org'];
+
+    /**
      * Default language code when not configured.
      */
     private const DEFAULT_LANGUAGE = 'en';
@@ -787,29 +799,74 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
 
         $languageCsv = self::languageFilter($languages);
 
+        [$raw, $viaHash] = self::hashThenFilenameSearch(
+            $path,
+            function (string $hash, int $size) use ($languageCsv): array {
+                return $this->searchSubtitles(
+                    self::withLanguages(['moviehash' => $hash, 'moviebytesize' => (string) $size], $languageCsv),
+                    $this->format,
+                    'hash',
+                );
+            },
+            function (string $basename) use ($languageCsv): array {
+                return $this->searchSubtitles(
+                    $this->filenameQueryParams($basename, $languageCsv),
+                    $this->format,
+                    'filename',
+                );
+            },
+        );
+
+        return $this->mapCandidates($raw, $viaHash ? SubtitleCandidate::MATCH_HASH : SubtitleCandidate::MATCH_NAME);
+    }
+
+    /**
+     * The shared hash→filename fallback sequence behind both path-search
+     * entries ({@see searchByPath()} and {@see searchByPathRaw()}): compute
+     * the OSDb moviehash once, query by hash+size when the file is hashable,
+     * and fall back to the filename heuristic when the hash is unusable or
+     * matched nothing. The two entries differ only in language handling
+     * (mapped CSV vs. documented verbatim pass-through) and return shape —
+     * that difference lives in the injected callables; the sequence itself
+     * is expressed exactly once here.
+     *
+     * @param callable(string, int): list<array{
+     *     id: string, language: string, format: string, downloads: int,
+     *     filename: string, imdb_id: ?string, file_id: int, rating: ?float,
+     *     hearing_impaired: bool, fps: ?float,
+     *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
+     * }> $byHash     invoked with (hash, size) for a hashable file
+     * @param callable(string): list<array{
+     *     id: string, language: string, format: string, downloads: int,
+     *     filename: string, imdb_id: ?string, file_id: int, rating: ?float,
+     *     hearing_impaired: bool, fps: ?float,
+     *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
+     * }> $byFilename invoked with the path's basename as the fallback leg
+     *
+     * @return array{0: list<array{
+     *     id: string, language: string, format: string, downloads: int,
+     *     filename: string, imdb_id: ?string, file_id: int, rating: ?float,
+     *     hearing_impaired: bool, fps: ?float,
+     *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
+     * }>, 1: bool} the results plus whether the hash leg produced them
+     *
+     * @since 0.6.1
+     */
+    private static function hashThenFilenameSearch(string $path, callable $byHash, callable $byFilename): array
+    {
         $hash = self::computeMovieHash($path);
         $size = is_file($path) ? filesize($path) : false;
 
         if ($hash !== '' && $size !== false && $size > 0) {
-            $raw = $this->searchSubtitles(
-                self::withLanguages(['moviehash' => $hash, 'moviebytesize' => (string) $size], $languageCsv),
-                $this->format,
-                'hash',
-            );
+            $results = $byHash($hash, $size);
 
-            if ($raw !== []) {
-                return $this->mapCandidates($raw, SubtitleCandidate::MATCH_HASH);
+            if ($results !== []) {
+                return [$results, true];
             }
         }
 
         // Fallback: no usable hash, or the hash matched nothing.
-        $raw = $this->searchSubtitles(
-            $this->filenameQueryParams(basename($path), $languageCsv),
-            $this->format,
-            'filename',
-        );
-
-        return $this->mapCandidates($raw, SubtitleCandidate::MATCH_NAME);
+        return [$byFilename(basename($path)), false];
     }
 
     /**
@@ -1072,18 +1129,17 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     {
         $this->ensureEnabled();
 
-        $hash = self::computeMovieHash($filePath);
-        $size = is_file($filePath) ? filesize($filePath) : false;
+        [$results] = self::hashThenFilenameSearch(
+            $filePath,
+            function (string $hash, int $size) use ($language, $subtitleFormat): array {
+                return $this->searchByHashRaw($hash, $size, $language, $subtitleFormat);
+            },
+            function (string $basename) use ($language, $subtitleFormat): array {
+                return $this->searchByFilenameRaw($basename, $language, $subtitleFormat);
+            },
+        );
 
-        if ($hash !== '' && $size !== false && $size > 0) {
-            $results = $this->searchByHashRaw($hash, $size, $language, $subtitleFormat);
-            if ($results !== []) {
-                return $results;
-            }
-        }
-
-        // Fallback: no usable hash, or the hash matched nothing.
-        return $this->searchByFilenameRaw(basename($filePath), $language, $subtitleFormat);
+        return $results;
     }
 
     /**
@@ -1349,25 +1405,41 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *    state recovery, not speculation ({@see attemptReauthAfter401()}).
      * 2. The actual subtitle bytes are fetched with a plain `GET` against that
      *    `link` (a different host, not `API_BASE`). The link must be HTTPS and
-     *    is fetched WITHOUT the consumer credentials — the API origin is the
-     *    only host that ever sees the `Api-Key` or the session token.
+     *    must name a host inside the OpenSubtitles trust domain ({@see
+     *    isTrustedDownloadLink()} — the scheme gate alone would leave the
+     *    host itself attacker-influenceable), and it is fetched WITHOUT the
+     *    consumer credentials — the API origin is the only host that ever
+     *    sees the `Api-Key` or the session token.
      *
      * Quota exhaustion is surfaced distinctly as
      * {@see OpenSubtitlesQuotaExceededException} — either from a 4xx `message`
      * body ({@see mapDownloadLinkFailure()}) or from a 200 response reporting
      * `remaining: 0` with no `link`.
      *
-     * @param int $fileId OpenSubtitles file ID (`attributes.files[].file_id`).
+     * @param int $fileId OpenSubtitles file ID (`attributes.files[].file_id`);
+     *        must be strictly positive — zero and negatives are cast residue of
+     *        malformed input and are refused locally, never POSTed.
      *
      * @return SubtitleDownload
      *
      * @throws OpenSubtitlesQuotaExceededException When the download quota is exhausted.
-     * @throws OpenSubtitlesException When the download otherwise fails.
+     * @throws OpenSubtitlesException When the download otherwise fails, including
+     *         a non-positive `$fileId`, an untrusted link host, or a non-HTTPS link.
      *
      * @since 0.1.0
      */
     public function downloadRaw(int $fileId): SubtitleDownload
     {
+        // Local fail-fast, cheaper than any state check: only ids this plugin
+        // minted are positive (mapCandidates drops non-positive file ids), so
+        // a zero or negative id is malformed input — and step 1 is a
+        // quota-consuming call that must never be spent on a guaranteed miss.
+        if ($fileId <= 0) {
+            throw new OpenSubtitlesException(
+                'OpenSubtitles download rejected: file id must be a positive integer, got ' . $fileId,
+            );
+        }
+
         $this->ensureEnabled();
 
         // Local fail-fast BEFORE any dial (login included): storming a window
@@ -1446,13 +1518,23 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             : "subtitle.{$this->format}";
 
         // The link is a raw, response-supplied URL to a foreign host. Refuse
-        // to fetch it in the clear, and never send consumer credentials
+        // to fetch it in the clear, refuse hosts outside the OpenSubtitles
+        // trust domain (a response-supplied target must never become a
+        // general egress primitive), and never send consumer credentials
         // cross-origin ({@see foreignOriginHeaders()}).
         if (!str_starts_with($link, 'https://')) {
             $this->logger->error('OpenSubtitles download link rejected: not an HTTPS URL');
 
             throw new OpenSubtitlesException(
                 'OpenSubtitles download link is not an HTTPS URL; refusing an in-the-clear fetch',
+            );
+        }
+
+        if (!self::isTrustedDownloadLink($link)) {
+            $this->logger->error('OpenSubtitles download link rejected: host outside the OpenSubtitles trust domain');
+
+            throw new OpenSubtitlesException(
+                'OpenSubtitles download link names a host outside the OpenSubtitles trust domain; refusing the fetch',
             );
         }
 
@@ -1696,7 +1778,10 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      */
     private static function responseCapExceededMessage(): string
     {
-        return 'HTTP response exceeded the ' . self::MAX_RESPONSE_BYTES . '-byte cap';
+        // MAX_RESPONSE_BYTES is an exact multiple of 1 MiB; >>20 is the
+        // locale-proof integer path (float-to-string would risk a decimal
+        // comma under non-en locales). The constant stays the source of truth.
+        return 'HTTP response exceeded the ' . (self::MAX_RESPONSE_BYTES >> 20) . ' MiB cap';
     }
 
     /**
@@ -1739,6 +1824,46 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     private static function isApiOrigin(string $url): bool
     {
         return parse_url($url, PHP_URL_HOST) === self::API_HOST;
+    }
+
+    /**
+     * True when `$url` names a host inside the OpenSubtitles download-link
+     * trust domain ({@see DOWNLOAD_LINK_TRUST_DOMAINS}) on the canonical HTTPS
+     * port. The boundary match (`$host === $domain || '.' . $domain` suffix)
+     * refuses look-alike hosts such as `opensubtitles.com.attacker.example`
+     * and `evil-opensubtitles.com`; an explicit port other than 443 would
+     * dial the trusted name's TLS origin on an attacker-chosen service port,
+     * so only the default port (or none) is accepted.
+     *
+     * Unparseable and empty hosts fail closed. A trusted name whose DNS
+     * answer points at a private address remains an upstream/DNS posture
+     * question outside this plugin: a check-then-dial resolution probe would
+     * re-resolve differently than the client's own dial anyway (DNS
+     * rebinding), so the honest boundary here is the name itself.
+     *
+     * @since 0.6.1
+     */
+    private static function isTrustedDownloadLink(string $url): bool
+    {
+        $host = parse_url($url, PHP_URL_HOST);
+        if (!is_string($host) || $host === '') {
+            return false;
+        }
+
+        $port = parse_url($url, PHP_URL_PORT);
+        if ($port !== null && $port !== 443) {
+            return false;
+        }
+
+        $host = strtolower($host);
+
+        foreach (self::DOWNLOAD_LINK_TRUST_DOMAINS as $domain) {
+            if ($host === $domain || str_ends_with($host, '.' . $domain)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -2255,8 +2380,35 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         }
 
         throw new OpenSubtitlesException(
-            "Invalid IMDb id '{$imdbId}': expected digits with an optional 'tt' prefix (e.g. '133093' or 'tt0133093')",
+            "Invalid IMDb id '" . self::safeMessageExcerpt($imdbId) . "': expected digits with an optional "
+            . "'tt' prefix (e.g. '133093' or 'tt0133093')",
         );
+    }
+
+    /**
+     * Bound and flatten caller-supplied input before interpolating it into an
+     * exception message. The provider's failures are logged verbatim and hosts
+     * render them further, so a crafted value must not forge extra log lines
+     * through embedded newlines (or any control/whitespace run) and must not
+     * pad the message to unbounded length.
+     *
+     * @param string $value     Raw caller input.
+     * @param int    $maxLength Byte budget for the excerpt.
+     *
+     * @return string Single-line bounded excerpt (`'...'`-marked when
+     *         truncated; an all-whitespace input legitimately yields '').
+     *
+     * @since 0.6.1
+     */
+    private static function safeMessageExcerpt(string $value, int $maxLength = 64): string
+    {
+        $collapsed = trim((string) preg_replace('/[\x00-\x1F\x7F\s]+/', ' ', $value));
+
+        if (strlen($collapsed) <= $maxLength) {
+            return $collapsed;
+        }
+
+        return rtrim(substr($collapsed, 0, $maxLength)) . '...';
     }
 
     /**
@@ -2438,8 +2590,11 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     }
 
     /**
-     * Derive a safe base filename (no directory component) for a downloaded
-     * subtitle, ensuring it carries the subtitle format extension.
+     * Derive a safe base filename (no directory component, no control chars,
+     * never a degenerate `.`/`..` token) for a downloaded subtitle, ensuring
+     * it carries the subtitle format extension. Both source branches — the
+     * provider-reported name and the composed release/format/language
+     * fallback — pass through one scrub and the one degenerate-name guard.
      *
      * @param string      $providerName Provider-reported file name (may be empty).
      * @param string|null $releaseName  Candidate release name fallback.
@@ -2457,18 +2612,40 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         string $format,
     ): string {
         // Base name only — strip any directory components and control chars.
-        $base = basename(trim($providerName));
-        $base = (string) preg_replace('#[\x00-\x1F/\\\\]+#', '', $base);
+        $base = (string) preg_replace('#[\x00-\x1F/\\\\]+#', '', basename(trim($providerName)));
 
-        if ($base === '' || $base === '.') {
+        // The parent-directory token joins out of a storage path; with the
+        // scrub applied first it can also be the residue of a hostile name, so
+        // both degenerate tokens share one predicate with the fallback branch.
+        if (self::isDegenerateFilename($base)) {
             $stem = pathinfo((string) $releaseName, PATHINFO_FILENAME);
             if ($stem === '') {
                 $stem = 'subtitle' . ($language !== '' ? '.' . $language : '');
             }
             $base = $stem . '.' . ($format !== '' ? $format : self::DEFAULT_FORMAT);
+
+            // The fallback interpolates configured format/language and
+            // API-reported values — none validated upstream — so it gets the
+            // same single scrub the provider branch received.
+            $base = (string) preg_replace('#[\x00-\x1F/\\\\]+#', '', $base);
         }
 
-        return $base;
+        // A composition that scrubs down to a degenerate token still must not
+        // escape the directory the host joins it into.
+        return self::isDegenerateFilename($base) ? 'subtitle.' . self::DEFAULT_FORMAT : $base;
+    }
+
+    /**
+     * Whether `$name` is a non-name: empty, the current-directory token, or
+     * the parent-directory token.
+     *
+     * @phpstan-assert-if-false non-empty-string $name
+     *
+     * @since 0.6.1
+     */
+    private static function isDegenerateFilename(string $name): bool
+    {
+        return $name === '' || $name === '.' || $name === '..';
     }
 
     /**
@@ -2567,6 +2744,16 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     {
         if (!$this->enabled) {
             throw new OpenSubtitlesException('OpenSubtitles provider is not enabled');
+        }
+
+        // The manifest declares api_key required and every request without it
+        // dies in a 401. Fail once, loudly, at the call boundary instead of
+        // paying an uncredentialed round trip per call.
+        if ($this->apiKey === '') {
+            throw new OpenSubtitlesException(
+                'OpenSubtitles provider is not configured: the required `api_key` setting is empty;'
+                . ' refusing an uncredentialed request',
+            );
         }
     }
 
