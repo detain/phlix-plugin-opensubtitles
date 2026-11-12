@@ -74,7 +74,7 @@ The plugin implements the `Phlix\Shared\Plugin\LifecycleInterface`, `Phlix\Share
    plugin then fetches that link with a plain, **credential-free HTTPS GET**
    (the consumer key and session token never leave the API origin, and
    non-HTTPS links are refused). Because step 1 meters the quota per call, a
-   file is posted for at most once per intentional request — never loop
+   file's link is requested at most once per intentional download — never loop
    `download()` speculatively, and treat the quota exception below as "stop
    for this window".
 

@@ -12,7 +12,7 @@
             "secret": true,
             "default": null,
             "tier": "standard",
-            "label": "OpenSubtitles API Key",
+            "label": "OpenSubtitles API key",
             "description": "The API key for your OpenSubtitles.com consumer (API application).",
             "link": "https://www.opensubtitles.com/en/consumers",
             "link_text": "OpenSubtitles API consumers"
@@ -23,7 +23,7 @@
             "default": null,
             "tier": "advanced",
             "label": "Username",
-            "description": "Your OpenSubtitles.com username. Optional — providing login credentials raises download limits (and unlocks VIP limits for VIP accounts)."
+            "description": "Your OpenSubtitles.com username. Optional; providing login credentials raises download limits (and unlocks VIP limits for VIP accounts)."
         },
         "password": {
             "type": "string",
@@ -32,7 +32,7 @@
             "default": null,
             "tier": "advanced",
             "label": "Password",
-            "description": "Your OpenSubtitles.com password. Optional; only used together with the username above."
+            "description": "Your OpenSubtitles.com password. Optional; only used together with the Username setting."
         },
         "language": {
             "type": "string",
