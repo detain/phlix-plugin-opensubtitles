@@ -9,8 +9,8 @@
 
 This plugin integrates [OpenSubtitles](https://www.opensubtitles.com/) into the Phlix subtitle pipeline. It allows searching for subtitles by:
 
-- **IMDB ID** — find subtitles for a specific movie/TV show
-- **Filename** — search subtitles by a media filename (its name stem is the search keyword; an embedded `tt…` IMDb id is used as an IMDB-ID lookup)
+- **IMDb ID** — find subtitles for a specific movie/TV show
+- **Filename** — search subtitles by a media filename (its name stem is the search keyword; an embedded `tt…` IMDb id is used as an IMDb ID lookup)
 - **File hash** — match subtitles using the OpenSubtitles `moviehash` algorithm
 
 ## Install
@@ -61,7 +61,7 @@ The plugin implements the `Phlix\Shared\Plugin\LifecycleInterface`, `Phlix\Share
    `api_key` alone — lower download limits, full search. The REST v1 API has
    **no user-agent registration endpoint**; see “User-Agent & OpenSubtitles
    ToS” below for what actually satisfies the terms.
-2. **Search** — queries subtitles by IMDB ID, filename, or `moviehash`. Each
+2. **Search** — queries subtitles by IMDb ID, filename, or `moviehash`. Each
    query returns the API **first page only** — result counts reflect that page,
    and the reported `meta.total_pages` is deliberately not followed; narrow the
    query instead of paging. The contract search methods map estate BCP-47 codes

@@ -31,7 +31,7 @@ use Workerman\Http\Response;
  *
  * This plugin integrates with the OpenSubtitles REST API v1 to search
  * and download subtitles for movies and TV shows. It supports search
- * by IMDB ID, filename, and file hash (`moviehash`).
+ * by IMDb ID, filename, and file hash (`moviehash`).
  *
  * ## Boot safety (Workerman/Webman resident memory)
  *
@@ -228,6 +228,14 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * Your quota will be renewed in ..."), bounded against a hostile body.
      */
     private const API_MESSAGE_EXCERPT_BYTES = 256;
+
+    /**
+     * Joined onto the remembered (period-free) quota message when a download
+     * is refused locally inside an exhausted quota window, e.g. "You have
+     * downloaded your allowed 20 subtitles for 24h; not retried locally until
+     * the quota window resets".
+     */
+    private const QUOTA_LOCAL_REFUSAL_SUFFIX = '; not retried locally until the quota window resets';
 
     /**
      * OpenSubtitles API key (consumer token).
@@ -1022,7 +1030,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $raw = $this->searchSubtitles(
             self::withLanguages(['imdb_id' => $imdbId], self::languageFilter($languages)),
             $this->format,
-            'IMDB ID',
+            'IMDb ID',
         );
 
         return $this->mapCandidates($raw, SubtitleCandidate::MATCH_IMDB);
@@ -1111,9 +1119,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     // ---------------------------------------------------------------------
 
     /**
-     * Low-level search for subtitles matching the given IMDB ID.
+     * Low-level search for subtitles matching the given IMDb ID.
      *
-     * @param string $imdbId         IMDB ID (e.g., "tt1234567").
+     * @param string $imdbId         IMDb ID (e.g., "tt1234567").
      * @param string $language       OpenSubtitles-domain language code, sent to
      *                               the API VERBATIM. Unlike the contract search
      *                               entries, this low-level `*Raw` call does not
@@ -1162,7 +1170,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         return $this->searchSubtitles([
             'imdb_id' => $imdbId,
             'languages' => $language,
-        ], $subtitleFormat, 'IMDB ID');
+        ], $subtitleFormat, 'IMDb ID');
     }
 
     /**
@@ -1285,7 +1293,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * Build the `/subtitles` query params for a filename-based search.
      *
      * A bare filename query is the weakest signal, but useful when we have
-     * neither an IMDB id nor an on-disk file to hash. When a `tt…` id is present
+     * neither an IMDb id nor an on-disk file to hash. When a `tt…` id is present
      * in the filename it is added for a stronger match.
      *
      * @param string      $filename    Media filename.
@@ -1757,6 +1765,28 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     }
 
     /**
+     * Drop a message's trailing sentence period(s) so a clause can be joined
+     * onto it without a "24h.; ..." collision. The `'...'` truncation marker
+     * of {@see safeMessageExcerpt()} is not a sentence period and is kept, so
+     * a cut excerpt still reads as cut. A message that is nothing but periods
+     * reads as null, so callers keep their "field absent" fallback.
+     *
+     * @param non-empty-string|null $message Bounded excerpt, or null when absent.
+     *
+     * @return non-empty-string|null
+     */
+    private static function withoutTrailingPeriod(?string $message): ?string
+    {
+        if ($message === null || str_ends_with($message, '...')) {
+            return $message;
+        }
+
+        $trimmed = rtrim($message, '. ');
+
+        return $trimmed !== '' ? $trimmed : null;
+    }
+
+    /**
      * Heuristically decide whether an API error message describes download
      * quota exhaustion.
      *
@@ -2153,7 +2183,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * answer from the API. A reset beyond {@see MAX_LATCH_WINDOW_SEC} is
      * clamped to it ({@see clampLatchHorizon()}). The remembered context is
      * stored as bounded excerpts: it is replayed into every local refusal's
-     * log line and exception.
+     * log line and exception. The message is stored period-free so the local
+     * refusal can join {@see QUOTA_LOCAL_REFUSAL_SUFFIX} onto it as one
+     * sentence.
      *
      * @param array<string, mixed> $data Decoded step-1 response body.
      *
@@ -2180,8 +2212,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $this->quotaBlockedUntil = $this->clampLatchHorizon($until, $now, 'download-quota', $resetUtc);
         $this->quotaResetTimeUtc = self::apiFieldExcerpt($resetUtc);
         $this->quotaResetTime = self::apiFieldExcerpt($data['reset_time'] ?? null);
-        $this->quotaMessage = self::apiFieldExcerpt($data['message'] ?? null, self::API_MESSAGE_EXCERPT_BYTES)
-            ?? 'OpenSubtitles download quota exhausted.';
+        $this->quotaMessage = self::withoutTrailingPeriod(
+            self::apiFieldExcerpt($data['message'] ?? null, self::API_MESSAGE_EXCERPT_BYTES),
+        ) ?? 'OpenSubtitles download quota exhausted';
 
         $this->logger->warning(
             'OpenSubtitles download quota exhausted until ' . gmdate('c', $this->quotaBlockedUntil)
@@ -2246,7 +2279,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             );
 
             throw new OpenSubtitlesQuotaExceededException(
-                (string) $this->quotaMessage . ' (not retried locally until the quota window resets)',
+                (string) $this->quotaMessage . self::QUOTA_LOCAL_REFUSAL_SUFFIX,
                 resetTime: $this->quotaResetTime,
                 resetTimeUtc: $this->quotaResetTimeUtc,
                 downloadsRemaining: 0,
@@ -2505,14 +2538,14 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
 
     /**
      * Normalize a raw `feature_details.imdb_id` value to this codebase's
-     * `tt`-prefixed IMDB id string convention.
+     * `tt`-prefixed IMDb id string convention.
      *
      * The real API returns `imdb_id` as a JSON NUMBER (e.g. `133093` for
      * `tt0133093`); it is re-padded to at least 7 digits and `tt`-prefixed.
      *
      * @param mixed $rawImdbId Raw `feature_details.imdb_id` value from the API.
      *
-     * @return string|null `tt`-prefixed IMDB id (e.g. "tt1234567"), or null.
+     * @return string|null `tt`-prefixed IMDb id (e.g. "tt1234567"), or null.
      *
      * @since 0.3.1
      */

@@ -675,6 +675,11 @@ final class OpenSubtitlesProviderTest extends TestCase
             $this->fail('Expected the remembered quota window to refuse locally.');
         } catch (OpenSubtitlesQuotaExceededException $e) {
             $this->assertStringContainsString('not retried locally', $e->getMessage());
+            $this->assertSame(
+                'You have downloaded your allowed 20 subtitles for 24h; not retried locally until the quota window resets',
+                $e->getMessage(),
+                "the API message's own trailing period must not collide with the local-refusal join",
+            );
             $this->assertSame($future, $e->resetTimeUtc);
             $this->assertSame(0, $e->downloadsRemaining);
         }
@@ -707,9 +712,50 @@ final class OpenSubtitlesProviderTest extends TestCase
             $this->fail('Expected the just-closed quota window to block locally.');
         } catch (OpenSubtitlesQuotaExceededException $e) {
             $this->assertStringContainsString('not retried locally', $e->getMessage());
+            $this->assertSame(
+                'OpenSubtitles download quota exhausted; not retried locally until the quota window resets',
+                $e->getMessage(),
+                'the message-less fallback is stored period-free and joined as one sentence',
+            );
         }
 
         $this->assertCount(2, $history, 'the blocked second download must not dial out');
+    }
+
+    public function test_local_quota_refusal_keeps_a_truncated_api_message_ellipsis_before_the_join(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $future = gmdate('Y-m-d\TH:i:s\Z', time() + 3600);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'remaining' => 0,
+                'reset_time_utc' => $future,
+                'message' => str_repeat('quota exhausted ', 40) . 'for 24h.',
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->downloadRaw(1);
+            $this->fail('Expected OpenSubtitlesQuotaExceededException.');
+        } catch (OpenSubtitlesQuotaExceededException) {
+        }
+
+        try {
+            $provider->downloadRaw(2);
+            $this->fail('Expected the remembered quota window to refuse locally.');
+        } catch (OpenSubtitlesQuotaExceededException $e) {
+            $this->assertStringEndsWith(
+                '...; not retried locally until the quota window resets',
+                $e->getMessage(),
+                'the excerpt truncation marker is not a sentence period and must survive the join',
+            );
+        }
+
+        $this->assertCount(1, $history);
     }
 
     public function test_download_429_retry_after_is_honored_locally(): void
@@ -2287,7 +2333,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $provider->onEnable($this->stubContainer());
 
         $this->expectException(OpenSubtitlesException::class);
-        $this->expectExceptionMessage('Search by IMDB ID failed');
+        $this->expectExceptionMessage('Search by IMDb ID failed');
         $provider->searchByImdbIdRaw('tt1234567');
     }
 
@@ -2314,7 +2360,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $provider->onEnable($this->stubContainer());
 
         $this->expectException(OpenSubtitlesException::class);
-        $this->expectExceptionMessage('Search by IMDB ID failed: response body was not a valid JSON envelope');
+        $this->expectExceptionMessage('Search by IMDb ID failed: response body was not a valid JSON envelope');
         $provider->searchByImdbIdRaw('tt1234567');
     }
 
@@ -2364,7 +2410,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $provider->onEnable($this->stubContainer());
 
         $this->expectException(OpenSubtitlesException::class);
-        $this->expectExceptionMessage('Search by IMDB ID failed: response envelope did not include a data list');
+        $this->expectExceptionMessage('Search by IMDb ID failed: response envelope did not include a data list');
         $provider->searchByImdbIdRaw('tt1234567');
     }
 
@@ -2422,7 +2468,7 @@ final class OpenSubtitlesProviderTest extends TestCase
             $provider->searchByImdbId('tt1234567', ['en']);
             $this->fail('envelope failure must surface as OpenSubtitlesException, not an empty candidate list');
         } catch (OpenSubtitlesException $e) {
-            $this->assertStringContainsString('Search by IMDB ID failed', $e->getMessage());
+            $this->assertStringContainsString('Search by IMDb ID failed', $e->getMessage());
         }
     }
 
@@ -2905,7 +2951,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $provider->onEnable($this->stubContainer());
 
         $this->expectException(OpenSubtitlesException::class);
-        $this->expectExceptionMessageMatches('/Search by IMDB ID failed: HTTP response exceeded the 10 MiB cap/');
+        $this->expectExceptionMessageMatches('/Search by IMDb ID failed: HTTP response exceeded the 10 MiB cap/');
         $provider->searchByImdbIdRaw('tt1234567');
     }
 
@@ -4257,7 +4303,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $provider->onEnable($this->stubContainer());
 
         $this->expectException(OpenSubtitlesException::class);
-        $this->expectExceptionMessage('Search by IMDB ID failed');
+        $this->expectExceptionMessage('Search by IMDb ID failed');
         $provider->searchByImdbIdRaw('tt1234567');
     }
 
@@ -4295,7 +4341,7 @@ final class OpenSubtitlesProviderTest extends TestCase
 
         $provider->onEnable($this->stubContainer());
 
-        // Filename with embedded IMDB ID should parse and use it
+        // Filename with embedded IMDb ID should parse and use it
         $provider->searchByPathRaw('/tmp/Movie.Name.2019.tt1234567.720p.mkv');
 
         $this->assertCount(1, $history);

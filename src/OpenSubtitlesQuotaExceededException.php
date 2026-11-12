@@ -41,7 +41,11 @@ class OpenSubtitlesQuotaExceededException extends OpenSubtitlesException
     /**
      * @param string      $message      Human-readable quota-exceeded message (the
      *        API's own `message` field when available, e.g. "You have downloaded
-     *        your allowed 20 subtitles for 24h.").
+     *        your allowed 20 subtitles for 24h."). A local fail-fast refusal
+     *        inside a remembered window carries the remembered message with
+     *        its trailing period dropped, joined as one sentence, e.g. "You
+     *        have downloaded your allowed 20 subtitles for 24h; not retried
+     *        locally until the quota window resets".
      * @param string|null $resetTime          Human-readable quota reset time (API field
      *        `reset_time`), if the API reported one.
      * @param string|null $resetTimeUtc       ISO-8601 UTC quota reset timestamp (API
