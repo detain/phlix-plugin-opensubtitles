@@ -85,9 +85,9 @@ use Workerman\Http\Response;
  *
  * ## Shared subtitle-source contract (Wave 3 F3)
  *
- * This entry class implements {@see SubtitleSourceInterface} (phlix-shared
- * v0.42.0) directly, so the host's subtitle-source registry detects it on the
- * entry instance (mirroring how metadata plugins carry
+ * This entry class implements {@see SubtitleSourceInterface} (introduced in
+ * phlix-shared v0.42.0) directly, so the host's subtitle-source registry
+ * detects it on the entry instance (mirroring how metadata plugins carry
  * {@see \Phlix\Shared\Metadata\MetadataSourceInterface}) and can register /
  * deregister it on plugin enable/disable. The contract methods ({@see getName()},
  * {@see getPriority()}, {@see searchByPath()}, {@see searchByHash()},
@@ -508,7 +508,16 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     /**
      * Loader hook called once when the plugin is disabled.
      *
-     * Cleans up the session token.
+     * Cleans up the session token and every other piece of per-session
+     * transient state (login latch, token expiry, quota/rate-limit windows) via
+     * {@see resetTransientState()}.
+     *
+     * The per-host HTTP client pool ({@see $httpClients}) is deliberately NOT
+     * torn down here: it is process-scoped, living as long as this plugin
+     * instance (i.e. the worker process), so a disable/enable cycle reuses the
+     * already-built strict-TLS clients instead of rebuilding them. The pool
+     * holds no credentials or session state — only connection plumbing — and
+     * which hosts it retains is governed solely by {@see httpClientFor()}.
      *
      * @return void
      *
@@ -831,20 +840,20 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * is expressed exactly once here.
      *
      * @param callable(string, int): list<array{
-     *     id: string, language: string, format: string, downloads: int,
+     *     id: string, language: non-empty-string, format: string, downloads: int,
      *     filename: string, imdb_id: ?string, file_id: int, rating: ?float,
      *     hearing_impaired: bool, fps: ?float,
      *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
      * }> $byHash     invoked with (hash, size) for a hashable file
      * @param callable(string): list<array{
-     *     id: string, language: string, format: string, downloads: int,
+     *     id: string, language: non-empty-string, format: string, downloads: int,
      *     filename: string, imdb_id: ?string, file_id: int, rating: ?float,
      *     hearing_impaired: bool, fps: ?float,
      *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
      * }> $byFilename invoked with the path's basename as the fallback leg
      *
      * @return array{0: list<array{
-     *     id: string, language: string, format: string, downloads: int,
+     *     id: string, language: non-empty-string, format: string, downloads: int,
      *     filename: string, imdb_id: ?string, file_id: int, rating: ?float,
      *     hearing_impaired: bool, fps: ?float,
      *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
@@ -1044,7 +1053,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *
      * @return list<array{
      *     id: string,
-     *     language: string,
+     *     language: non-empty-string,
      *     format: string,
      *     downloads: int,
      *     filename: string,
@@ -1107,7 +1116,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *
      * @return list<array{
      *     id: string,
-     *     language: string,
+     *     language: non-empty-string,
      *     format: string,
      *     downloads: int,
      *     filename: string,
@@ -1159,7 +1168,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *
      * @return list<array{
      *     id: string,
-     *     language: string,
+     *     language: non-empty-string,
      *     format: string,
      *     downloads: int,
      *     filename: string,
@@ -1249,7 +1258,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *
      * @return list<array{
      *     id: string,
-     *     language: string,
+     *     language: non-empty-string,
      *     format: string,
      *     downloads: int,
      *     filename: string,
@@ -1301,7 +1310,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *
      * @return list<array{
      *     id: string,
-     *     language: string,
+     *     language: non-empty-string,
      *     format: string,
      *     downloads: int,
      *     filename: string,
@@ -2189,7 +2198,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      *
      * @return list<array{
      *     id: string,
-     *     language: string,
+     *     language: non-empty-string,
      *     format: string,
      *     downloads: int,
      *     filename: string,
@@ -2239,14 +2248,17 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             $filename = $primaryFile['file_name'] ?? "subtitle.{$preferredFormat}";
             $format = self::formatFromFilename($primaryFile['file_name']) ?? $preferredFormat;
             $languageRaw = $attributes['language'] ?? null;
-            if (!is_string($languageRaw) || trim($languageRaw) === '') {
+            // Gate and store the SAME trimmed value: an untrimmed ' en ' would
+            // pass an emptiness check yet reach host language filters as a
+            // code that never equals 'en'.
+            $languageCode = is_string($languageRaw) ? trim($languageRaw) : '';
+            if ($languageCode === '') {
                 // Parse-boundary fail-fast: a result without a usable language
                 // is skipped, never relabeled a default — a fabricated 'en'
                 // would pass host language filters with wrong-language text.
                 continue;
             }
 
-            $languageCode = $languageRaw;
             $downloadCount = is_int($attributes['download_count'] ?? null) ? $attributes['download_count'] : 0;
             $imdbId = self::normalizeImdbId($featureDetails['imdb_id'] ?? null);
             $rating = self::floatOrNull($attributes['ratings'] ?? null);
@@ -2489,7 +2501,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * value objects, stamping how each was matched.
      *
      * @param list<array{
-     *     id: string, language: string, format: string, downloads: int,
+     *     id: string, language: non-empty-string, format: string, downloads: int,
      *     filename: string, imdb_id: ?string, file_id: int, rating: ?float,
      *     hearing_impaired: bool, fps: ?float,
      *     files: list<array{file_id: int, file_name: ?string, cd_number: int}>
@@ -2512,12 +2524,15 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
 
             $downloadId = (string) $row['file_id'];
 
-            $language = $row['language'] !== '' ? $row['language'] : self::DEFAULT_LANGUAGE;
             $format = $row['format'] !== '' ? $row['format'] : self::DEFAULT_FORMAT;
 
+            // No language fallback here: the parse boundary in the `*Raw`
+            // result mapper is the single source of that law — rows without a
+            // usable (trimmed, non-empty) language were already skipped there,
+            // never relabeled a default.
             $candidates[] = new SubtitleCandidate(
                 provider: self::SOURCE_NAME,
-                language: $language,
+                language: $row['language'],
                 downloadId: $downloadId,
                 releaseName: $row['filename'],
                 format: $format,
