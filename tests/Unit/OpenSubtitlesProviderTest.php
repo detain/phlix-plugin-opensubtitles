@@ -2768,7 +2768,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $provider->onEnable($this->stubContainer());
 
         $this->expectException(OpenSubtitlesException::class);
-        $this->expectExceptionMessageMatches('/Download failed/');
+        $this->expectExceptionMessageMatches('/^OpenSubtitles download failed: HTTP 404$/');
         $provider->downloadRaw(998877);
     }
 
@@ -2914,9 +2914,9 @@ final class OpenSubtitlesProviderTest extends TestCase
         $provider->onEnable($this->stubContainer());
 
         // Over-cap must surface the documented HTTP-failure envelope wrapped
-        // as 'Download failed: ...' — never a partial success, never [].
+        // as 'OpenSubtitles download failed: ...' — never a partial success, never [].
         $this->expectException(OpenSubtitlesException::class);
-        $this->expectExceptionMessageMatches('/Download failed: HTTP response exceeded the 10 MiB cap/');
+        $this->expectExceptionMessageMatches('/^OpenSubtitles download failed: HTTP response exceeded the 10 MiB cap/');
         $provider->downloadRaw(998877);
     }
 
@@ -4550,7 +4550,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $provider->onEnable($this->stubContainer());
 
         $this->expectException(OpenSubtitlesException::class);
-        $this->expectExceptionMessage('Download failed');
+        $this->expectExceptionMessage('OpenSubtitles download failed: Download connection lost');
         $provider->downloadRaw(12345);
     }
 
@@ -4606,7 +4606,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $provider->onEnable($this->stubContainer());
 
         $this->expectException(OpenSubtitlesException::class);
-        $this->expectExceptionMessage('Download failed: HTTP 500');
+        $this->expectExceptionMessage('OpenSubtitles download failed: HTTP 500');
         $provider->downloadRaw(998877);
     }
 
@@ -5121,7 +5121,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $provider->onEnable($this->stubContainer());
 
         $this->expectException(OpenSubtitlesException::class);
-        $this->expectExceptionMessage('Download failed: Connection refused');
+        $this->expectExceptionMessage('OpenSubtitles download failed: Connection refused');
         $provider->downloadRaw(12345);
     }
 

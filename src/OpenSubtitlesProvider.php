@@ -703,6 +703,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * proceeds without a token — login is optional by contract, and looping
      * forever is never an option in a resident worker.
      *
+     * The bound is approximate: each iteration assumes its full 10ms nap
+     * elapsed (no clock read), so scheduler latency can stretch the real wait.
+     *
      * @return void
      */
     private function awaitLoginInFlight(): void
@@ -1649,7 +1652,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         } catch (OpenSubtitlesException $e) {
             $this->logger->error('OpenSubtitles download failed: ' . $e->getMessage());
 
-            throw new OpenSubtitlesException('Download failed: ' . $e->getMessage(), 0, $e);
+            throw new OpenSubtitlesException('OpenSubtitles download failed: ' . $e->getMessage(), 0, $e);
         }
 
         $decoded = json_decode($linkResponse['body'], true);
@@ -1716,13 +1719,13 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         } catch (OpenSubtitlesException $e) {
             $this->logger->error('OpenSubtitles download failed: ' . $e->getMessage());
 
-            throw new OpenSubtitlesException('Download failed: ' . $e->getMessage(), 0, $e);
+            throw new OpenSubtitlesException('OpenSubtitles download failed: ' . $e->getMessage(), 0, $e);
         }
 
         if ($contentResponse['status'] < 200 || $contentResponse['status'] >= 300) {
             $this->logger->error('OpenSubtitles download failed: HTTP ' . $contentResponse['status']);
 
-            throw new OpenSubtitlesException('Download failed: HTTP ' . $contentResponse['status']);
+            throw new OpenSubtitlesException('OpenSubtitles download failed: HTTP ' . $contentResponse['status']);
         }
 
         return new SubtitleDownload(
@@ -1962,6 +1965,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
 
             // Cooperative wait — yields to the event loop (Swoole coroutine hooks
             // make usleep yield), allowing other tasks to proceed meanwhile.
+            // The bound is approximate: each iteration assumes its full 10ms
+            // nap elapsed (no clock read), so scheduler latency can stretch it.
             $maxWait = self::HTTP_TIMEOUT_SEC + 1.0;
             $waited = 0.0;
             while (!$state['done'] && $waited < $maxWait) {
