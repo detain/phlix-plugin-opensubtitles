@@ -301,8 +301,18 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     private ?int $quotaBlockedUntil = null;
 
     /**
-     * Unix timestamp until which API calls are refused locally because a
-     * 429 carried a parsable `Retry-After`.
+     * Unix timestamp until which business calls are refused locally (zero
+     * network, the deferred login included) because an HTTP 429 carried a
+     * parsable, future `Retry-After` ({@see rememberRateWindow()}).
+     *
+     * Fed by a 429 on any API dial: the search GET, the step-1 download POST
+     * and the login POST. Checked at call entry by
+     * {@see guardSearchNotDeferred()} and {@see guardDownloadNotDeferred()},
+     * which clear it once the window has passed; dropped by
+     * {@see resetTransientState()}. Both guards re-check after the deferred
+     * login, so a login 429 also refuses its own call's business dial: the
+     * API has declared the client rate-limited, and that dial would only
+     * deepen the hole.
      */
     private ?int $rateLimitedUntil = null;
 
@@ -701,16 +711,37 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * 429, 5xx, token-less 2xx) unlatch it for a retry on the next call,
      * while a confirmed 4xx credential rejection keeps it closed.
      *
+     * Credentials that cannot be JSON-encoded (invalid UTF-8) are refused
+     * locally: no POST is made, the cause is logged without echoing either
+     * value, and the latch stays open — the API never judged them, so this is
+     * not a confirmed rejection (and the refusal costs no network). A 429's
+     * `Retry-After` is remembered via {@see rememberRateWindow()} exactly as
+     * on a business call, so the caller's own business dial and every later
+     * call are refused locally until the window passes.
+     *
      * @return void
      *
      * @since 0.1.0
      */
     private function login(): void
     {
-        $body = (string) json_encode([
-            'username' => $this->username,
-            'password' => $this->password,
-        ]);
+        try {
+            $body = json_encode([
+                'username' => $this->username,
+                'password' => $this->password,
+            ], JSON_THROW_ON_ERROR);
+        } catch (\JsonException $e) {
+            // Never `(string) false` an empty body onto the wire. The
+            // JsonException message names the encoding fault only, never the
+            // offending value, so it is safe to log.
+            $this->loginAttempted = false;
+            $this->logger->warning(
+                'OpenSubtitles login skipped: the configured credentials could not be JSON-encoded ('
+                    . $e->getMessage() . '); username and password must be valid UTF-8. Continuing anonymously',
+            );
+
+            return;
+        }
 
         try {
             $response = $this->httpRequest('POST', 'login', ['Content-Type' => 'application/json'], $body);
@@ -727,6 +758,10 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             if ($status === 429 || $status >= 500) {
                 $this->loginAttempted = false;
             }
+
+            // A login 429 is the API declaring a rate window like any other:
+            // honor it locally so the next call does not re-dial into it.
+            $this->rememberRateWindow($response);
 
             $this->logger->warning('OpenSubtitles login failed with HTTP ' . $status);
 
@@ -1455,21 +1490,45 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         // the API already declared dead only deepens the hole.
         $this->guardDownloadNotDeferred();
 
-        $this->ensureConnected();
-
-        $contentType = ['Content-Type' => 'application/json'];
-
         $body = ['file_id' => $fileId];
         if ($this->format !== '') {
             $body['sub_format'] = $this->format;
         }
+
+        // Encode BEFORE any dial (login included): a body that cannot be sent
+        // must never become a `(string) false` empty POST to the
+        // quota-consuming endpoint. The JsonException message names the
+        // encoding fault only, never the offending value.
+        try {
+            $payload = json_encode($body, JSON_THROW_ON_ERROR);
+        } catch (\JsonException $e) {
+            $this->logger->error(
+                'OpenSubtitles download failed: request body could not be JSON-encoded: ' . $e->getMessage(),
+            );
+
+            throw new OpenSubtitlesException(
+                'Download failed: request body could not be JSON-encoded (' . $e->getMessage()
+                    . '); the configured subtitle format must be valid UTF-8',
+                0,
+                $e,
+            );
+        }
+
+        $this->ensureConnected();
+
+        // Re-check after the deferred login: a login answered with a 429
+        // `Retry-After` has just declared a rate window, and the
+        // quota-consuming step-1 POST must not dial into it.
+        $this->guardDownloadNotDeferred();
+
+        $contentType = ['Content-Type' => 'application/json'];
 
         try {
             $linkResponse = $this->httpRequest(
                 'POST',
                 self::API_BASE . 'download',
                 array_merge($contentType, $this->authHeaders()),
-                (string) json_encode($body),
+                $payload,
             );
 
             // A 401 here means our session token died server-side. The
@@ -1483,7 +1542,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
                     'POST',
                     self::API_BASE . 'download',
                     array_merge($contentType, $this->authHeaders()),
-                    (string) json_encode($body),
+                    $payload,
                 );
             }
         } catch (OpenSubtitlesException $e) {

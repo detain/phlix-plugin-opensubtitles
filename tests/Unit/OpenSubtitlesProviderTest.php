@@ -496,6 +496,147 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertFalse($provider->isLoggedIn());
     }
 
+    /**
+     * OSB-1: credentials that cannot be JSON-encoded (invalid UTF-8) must
+     * refuse the login POST LOCALLY — no `(string) false` empty body on the
+     * wire — log an honest cause that never echoes the secret, and leave the
+     * {@see OpenSubtitlesProvider::$loginAttempted} latch open: the API never
+     * judged these credentials, so this is not a confirmed rejection.
+     */
+    public function test_unencodable_credentials_refuse_login_post_with_honest_log_and_no_latch(): void
+    {
+        $logger = $this->warningRecorder();
+        $secret = "CANARY-secret-\xB1\xFF";
+
+        $provider = new OpenSubtitlesProvider(
+            apiKey: self::TEST_API_KEY,
+            username: 'u',
+            password: $secret,
+        );
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, '{"data":[]}'),
+            self::response(200, '{"data":[]}'),
+        ], $history);
+
+        $provider->onEnable($this->containerFor($logger));
+        $this->assertSame([], $provider->searchByImdbIdRaw('tt1'), 'search continues anonymously');
+        $this->assertSame([], $provider->searchByImdbIdRaw('tt2'));
+
+        $loginCalls = array_filter($history, static fn (array $h): bool => str_ends_with($h['url'], '/login'));
+        $this->assertCount(0, $loginCalls, 'an unencodable body must never reach the wire');
+        $this->assertCount(2, $history, 'only the two search dials');
+        $this->assertFalse($provider->isLoggedIn());
+
+        $latch = new \ReflectionProperty(OpenSubtitlesProvider::class, 'loginAttempted');
+        $this->assertFalse($latch->getValue($provider), 'a local encode refusal must not latch the login');
+
+        $causes = array_values(array_filter(
+            $logger->warnings,
+            static fn (string $w): bool => str_contains($w, 'could not be JSON-encoded'),
+        ));
+        $this->assertCount(2, $causes, 'each refused attempt states its cause');
+        $this->assertStringContainsString('UTF-8', $causes[0]);
+        foreach ($logger->warnings as $warning) {
+            $this->assertStringNotContainsString('CANARY', $warning, 'the secret must never be echoed');
+        }
+    }
+
+    /**
+     * OSB-2: a login answered with HTTP 429 + `Retry-After` is the API
+     * declaring a rate window like any other 429 — it must be remembered, so
+     * the search that drew it and every later call are refused locally (zero
+     * further dials, login included).
+     */
+    public function test_login_429_retry_after_feeds_the_rate_window(): void
+    {
+        $provider = $this->providerWithCredentials();
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(429, '{"message":"slow down"}', ['Retry-After' => '120']),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        foreach (['tt1', 'tt2'] as $imdbId) {
+            try {
+                $provider->searchByImdbIdRaw($imdbId);
+                $this->fail("Expected the login-429 window to refuse search {$imdbId} locally.");
+            } catch (OpenSubtitlesException $e) {
+                $this->assertStringContainsString('rate-limited', $e->getMessage());
+            }
+        }
+
+        try {
+            $provider->downloadRaw(1);
+            $this->fail('Expected the login-429 window to refuse the next download locally.');
+        } catch (OpenSubtitlesException $e) {
+            $this->assertStringContainsString('rate-limited', $e->getMessage());
+        }
+
+        $this->assertFalse($provider->isLoggedIn());
+        $this->assertCount(1, $history, 'only the login dial; nothing inside the login-declared window');
+    }
+
+    /**
+     * OSB-2 (download entry): a login-429 drawn by downloadRaw()'s deferred
+     * login must stop the quota-consuming step-1 POST of that same call.
+     */
+    public function test_login_429_during_download_refuses_step_one_dial(): void
+    {
+        $provider = $this->providerWithCredentials();
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(429, '{"message":"slow down"}', ['Retry-After' => '120']),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->downloadRaw(1);
+            $this->fail('Expected the login-429 window to refuse the step-1 dial.');
+        } catch (OpenSubtitlesException $e) {
+            $this->assertStringContainsString('Download deferred', $e->getMessage());
+            $this->assertNotInstanceOf(OpenSubtitlesQuotaExceededException::class, $e);
+        }
+
+        $this->assertCount(1, $history, 'login only; step-1 never dialed into the window');
+        $this->assertStringEndsWith('/login', $history[0]['url']);
+    }
+
+    /**
+     * OSB-1 (step-1 leg): a step-1 download body that cannot be JSON-encoded
+     * (invalid UTF-8 `sub_format`) must fail honestly BEFORE any dial — never
+     * POST an empty body to the quota-consuming endpoint, nor log in for a
+     * request that cannot be sent.
+     */
+    public function test_download_step_one_unencodable_body_fails_before_any_dial(): void
+    {
+        $provider = new OpenSubtitlesProvider(
+            apiKey: self::TEST_API_KEY,
+            username: 'u',
+            password: 'p',
+            format: "srt\xB1",
+        );
+
+        $history = [];
+        $this->installFakeTransport($provider, [], $history);
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->downloadRaw(1);
+            $this->fail('Expected an unencodable step-1 body to fail locally.');
+        } catch (OpenSubtitlesException $e) {
+            $this->assertStringContainsString('could not be JSON-encoded', $e->getMessage());
+            $this->assertStringNotContainsString("\xB1", $e->getMessage());
+        }
+
+        $this->assertSame([], $history, 'no login and no step-1 dial');
+    }
+
     // ---------------------------------------------------------------------
     // Budget & rate-limit memory (review osst__secaudit M07): a consumed
     // quota window and a 429 Retry-After must be REMEMBERED and honored with
@@ -2819,6 +2960,46 @@ final class OpenSubtitlesProviderTest extends TestCase
             public function has(string $id): bool
             {
                 return false;
+            }
+        };
+    }
+
+    /**
+     * A PSR-3 logger that records every warning message it receives.
+     *
+     * @return \Psr\Log\NullLogger&object{warnings: list<string>}
+     */
+    private function warningRecorder(): \Psr\Log\NullLogger
+    {
+        return new class extends \Psr\Log\NullLogger {
+            /** @var list<string> */
+            public array $warnings = [];
+
+            public function warning(\Stringable|string $message, array $context = []): void
+            {
+                $this->warnings[] = (string) $message;
+            }
+        };
+    }
+
+    /**
+     * A container that serves exactly one PSR-3 logger.
+     */
+    private function containerFor(\Psr\Log\LoggerInterface $logger): ContainerInterface
+    {
+        return new class ($logger) implements ContainerInterface {
+            public function __construct(private \Psr\Log\LoggerInterface $logger)
+            {
+            }
+
+            public function get(string $id): mixed
+            {
+                return $this->logger;
+            }
+
+            public function has(string $id): bool
+            {
+                return $id === \Psr\Log\LoggerInterface::class;
             }
         };
     }
