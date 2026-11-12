@@ -208,6 +208,28 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     private const TOKEN_EXPIRY_SAFETY_SEC = 60;
 
     /**
+     * Longest local refusal ONE provider-supplied window may buy: both the
+     * 429 `Retry-After` latch ({@see rememberRateWindow()}) and the exhausted
+     * quota latch ({@see rememberQuotaWindow()}) are clamped to this horizon.
+     *
+     * 24h is the API's own download-quota period, so an honest window never
+     * needs more. A hostile or broken response advertising a far-future
+     * window (a decade-long `Retry-After`, a year-3000 `reset_time_utc`)
+     * therefore parks the provider for at most one day, never until restart:
+     * once the clamped latch lapses the guards clear it and the next call
+     * re-dials for an honest answer — re-latching if the API still refuses.
+     */
+    private const MAX_LATCH_WINDOW_SEC = 86_400;
+
+    /**
+     * Byte budget for an API-supplied `message` interpolated into a log line
+     * or exception message. Generous enough for the real quota notice
+     * (~150 bytes: "You have downloaded your allowed 20 subtitles for 24h.
+     * Your quota will be renewed in ..."), bounded against a hostile body.
+     */
+    private const API_MESSAGE_EXCERPT_BYTES = 256;
+
+    /**
      * OpenSubtitles API key (consumer token).
      */
     private string $apiKey;
@@ -296,14 +318,16 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * Unix timestamp until which step-1 download POSTs are REFUSED LOCALLY
      * (no network) because the API reported `remaining: 0` with a concrete
      * future `reset_time_utc` — the orchestrator's multi-file loop must not
-     * storm an already-exhausted quota window.
+     * storm an already-exhausted quota window. Clamped to
+     * {@see MAX_LATCH_WINDOW_SEC} from the latching response.
      */
     private ?int $quotaBlockedUntil = null;
 
     /**
      * Unix timestamp until which business calls are refused locally (zero
      * network, the deferred login included) because an HTTP 429 carried a
-     * parsable, future `Retry-After` ({@see rememberRateWindow()}).
+     * parsable, future `Retry-After` ({@see rememberRateWindow()}), clamped
+     * to {@see MAX_LATCH_WINDOW_SEC}.
      *
      * Fed by a 429 on any API dial: the search GET, the step-1 download POST
      * and the login POST. Checked at call entry by
@@ -318,7 +342,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
 
     /**
      * Quota-window context remembered for the local refusal so the surfaced
-     * exception keeps the API's own fields ({@see OpenSubtitlesQuotaExceededException}).
+     * exception keeps the API's own fields ({@see OpenSubtitlesQuotaExceededException}),
+     * stored as bounded single-line excerpts ({@see apiFieldExcerpt()}).
      */
     private ?string $quotaMessage = null;
 
@@ -1649,20 +1674,24 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      */
     private function mapDownloadLinkFailure(int $statusCode, array $data): OpenSubtitlesException
     {
+        // Classify on the RAW message (the heuristic must see what the API
+        // said), but only a bounded single-line excerpt ever crosses the
+        // log/throw boundary.
         $message = is_string($data['message'] ?? null) ? $data['message'] : null;
+        $excerpt = self::apiFieldExcerpt($message, self::API_MESSAGE_EXCERPT_BYTES);
 
-        if ($statusCode < 500 && $message !== null && self::looksLikeQuotaMessage($message)) {
-            $this->logger->warning('OpenSubtitles download quota exceeded: ' . $message);
+        if ($statusCode < 500 && $message !== null && $excerpt !== null && self::looksLikeQuotaMessage($message)) {
+            $this->logger->warning('OpenSubtitles download quota exceeded: ' . $excerpt);
 
             return new OpenSubtitlesQuotaExceededException(
-                $message,
-                resetTime: is_string($data['reset_time'] ?? null) ? $data['reset_time'] : null,
-                resetTimeUtc: is_string($data['reset_time_utc'] ?? null) ? $data['reset_time_utc'] : null,
+                $excerpt,
+                resetTime: self::apiFieldExcerpt($data['reset_time'] ?? null),
+                resetTimeUtc: self::apiFieldExcerpt($data['reset_time_utc'] ?? null),
                 downloadsRemaining: self::intOrNull($data['remaining'] ?? null),
             );
         }
 
-        $detail = $message ?? ('HTTP ' . $statusCode);
+        $detail = $excerpt ?? ('HTTP ' . $statusCode);
         $this->logger->error('OpenSubtitles download failed: ' . $detail);
 
         return new OpenSubtitlesException('Download failed: ' . $detail);
@@ -1680,16 +1709,37 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      */
     private static function quotaExceededException(array $data): OpenSubtitlesQuotaExceededException
     {
-        $message = is_string($data['message'] ?? null) && $data['message'] !== ''
-            ? $data['message']
-            : 'OpenSubtitles download quota exceeded: no downloads remaining';
+        $message = self::apiFieldExcerpt($data['message'] ?? null, self::API_MESSAGE_EXCERPT_BYTES)
+            ?? 'OpenSubtitles download quota exceeded: no downloads remaining';
 
         return new OpenSubtitlesQuotaExceededException(
             $message,
-            resetTime: is_string($data['reset_time'] ?? null) ? $data['reset_time'] : null,
-            resetTimeUtc: is_string($data['reset_time_utc'] ?? null) ? $data['reset_time_utc'] : null,
+            resetTime: self::apiFieldExcerpt($data['reset_time'] ?? null),
+            resetTimeUtc: self::apiFieldExcerpt($data['reset_time_utc'] ?? null),
             downloadsRemaining: self::intOrNull($data['remaining'] ?? null),
         );
+    }
+
+    /**
+     * Bounded single-line excerpt of a provider-supplied string field, for
+     * any value that crosses a log or throw boundary (exception message or
+     * exception context field). Non-strings and values that collapse to
+     * nothing read as null, so callers keep their "field absent" fallback.
+     *
+     * @param mixed $value     Raw decoded field value.
+     * @param int   $maxLength Byte budget, see {@see safeMessageExcerpt()}.
+     *
+     * @return non-empty-string|null
+     */
+    private static function apiFieldExcerpt(mixed $value, int $maxLength = 64): ?string
+    {
+        if (!is_string($value)) {
+            return null;
+        }
+
+        $excerpt = self::safeMessageExcerpt($value, $maxLength);
+
+        return $excerpt !== '' ? $excerpt : null;
     }
 
     /**
@@ -2006,6 +2056,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * or HTTP-date) so subsequent calls refuse locally until it passes. A
      * missing or unparsable header latches nothing — honest: without a
      * promised window the next call goes to the network as it always has.
+     * A window beyond {@see MAX_LATCH_WINDOW_SEC} is clamped to it
+     * ({@see clampLatchHorizon()}), so one hostile 429 cannot park the
+     * provider until restart.
      *
      * @param array{status:int, body:string, headers?:array<string,string|list<string>>} $response
      *
@@ -2022,11 +2075,23 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             return;
         }
 
-        $until = ctype_digit($retryAfter) ? time() + (int) $retryAfter : strtotime($retryAfter);
+        $now = time();
 
-        if (!is_int($until) || $until <= time()) {
+        if (ctype_digit($retryAfter)) {
+            // (int) saturates an oversized digit run at PHP_INT_MAX; never add
+            // that to $now (int overflow promotes to float) — anything past
+            // the cap is simply "beyond the clamp".
+            $delta = (int) $retryAfter;
+            $until = $delta > self::MAX_LATCH_WINDOW_SEC ? PHP_INT_MAX : $now + $delta;
+        } else {
+            $until = strtotime($retryAfter);
+        }
+
+        if (!is_int($until) || $until <= $now) {
             return;
         }
+
+        $until = $this->clampLatchHorizon($until, $now, 'rate-limit', $retryAfter);
 
         $this->rateLimitedUntil = $until;
         $this->logger->warning(
@@ -2035,12 +2100,46 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     }
 
     /**
+     * Clamp a provider-advertised latch horizon to {@see MAX_LATCH_WINDOW_SEC}
+     * from now. Beyond the clamp the advertised window is not trustworthy:
+     * the latch holds only to the clamp, after which the guards clear it and
+     * the next call re-dials for the API's honest answer. A clamp is logged
+     * loudly, naming the advertised value (excerpted) and the effective one.
+     *
+     * @param int    $until      Advertised horizon (Unix timestamp, > $now).
+     * @param int    $now        The caller's reference "now".
+     * @param string $window     Window kind for the log line.
+     * @param string $advertised Raw advertised value (excerpted before logging).
+     *
+     * @return int The effective horizon.
+     */
+    private function clampLatchHorizon(int $until, int $now, string $window, string $advertised): int
+    {
+        $cap = $now + self::MAX_LATCH_WINDOW_SEC;
+
+        if ($until <= $cap) {
+            return $until;
+        }
+
+        $this->logger->warning(
+            'OpenSubtitles advertised a ' . $window . " window beyond the local clamp ('"
+                . self::safeMessageExcerpt($advertised) . "'); refusing locally only until "
+                . gmdate('c', $cap) . ', then re-dialing for an honest answer',
+        );
+
+        return $cap;
+    }
+
+    /**
      * Remember an exhausted download window (`remaining: 0` with a concrete
      * future `reset_time_utc`) so the caller's file loop cannot storm the
      * quota-consuming step-1 POST inside a window the API already declared
      * dead. A missing, unparsable, or past reset advertises no trustworthy
      * window: nothing latches, the next call re-dials and takes its honest
-     * answer from the API.
+     * answer from the API. A reset beyond {@see MAX_LATCH_WINDOW_SEC} is
+     * clamped to it ({@see clampLatchHorizon()}). The remembered context is
+     * stored as bounded excerpts: it is replayed into every local refusal's
+     * log line and exception.
      *
      * @param array<string, mixed> $data Decoded step-1 response body.
      *
@@ -2058,23 +2157,22 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             return;
         }
 
+        $now = time();
         $until = strtotime($resetUtc);
-        if ($until === false || $until <= time()) {
+        if ($until === false || $until <= $now) {
             return;
         }
 
-        $this->quotaBlockedUntil = $until;
-        $this->quotaResetTimeUtc = $resetUtc;
-        $this->quotaResetTime = is_string($data['reset_time'] ?? null) ? $data['reset_time'] : null;
-
-        $message = $data['message'] ?? null;
-        $this->quotaMessage = is_string($message) && $message !== ''
-            ? $message
-            : 'OpenSubtitles download quota exhausted.';
+        $this->quotaBlockedUntil = $this->clampLatchHorizon($until, $now, 'download-quota', $resetUtc);
+        $this->quotaResetTimeUtc = self::apiFieldExcerpt($resetUtc);
+        $this->quotaResetTime = self::apiFieldExcerpt($data['reset_time'] ?? null);
+        $this->quotaMessage = self::apiFieldExcerpt($data['message'] ?? null, self::API_MESSAGE_EXCERPT_BYTES)
+            ?? 'OpenSubtitles download quota exhausted.';
 
         $this->logger->warning(
-            'OpenSubtitles download quota exhausted until ' . $resetUtc
-                . '; further downloads refused locally until the window resets',
+            'OpenSubtitles download quota exhausted until ' . gmdate('c', $this->quotaBlockedUntil)
+                . " (API reset_time_utc '" . (string) $this->quotaResetTimeUtc
+                . "'); further downloads refused locally until then",
         );
     }
 
@@ -2129,7 +2227,8 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
 
         if ($this->quotaBlockedUntil > time()) {
             $this->logger->warning(
-                'OpenSubtitles download refused locally: quota exhausted until ' . (string) $this->quotaResetTimeUtc,
+                'OpenSubtitles download refused locally: quota exhausted until '
+                    . gmdate('c', $this->quotaBlockedUntil),
             );
 
             throw new OpenSubtitlesQuotaExceededException(
@@ -2457,13 +2556,14 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     }
 
     /**
-     * Bound and flatten caller-supplied input before interpolating it into an
-     * exception message. The provider's failures are logged verbatim and hosts
-     * render them further, so a crafted value must not forge extra log lines
-     * through embedded newlines (or any control/whitespace run) and must not
-     * pad the message to unbounded length.
+     * Bound and flatten caller- or provider-supplied text before interpolating
+     * it into a log line or exception message. The provider's failures are
+     * logged verbatim and hosts render them further, so a crafted value (a
+     * caller's IMDb id, an API `message` / `reset_time_utc`) must not forge
+     * extra log lines through embedded newlines (or any control/whitespace
+     * run) and must not pad the message to unbounded length.
      *
-     * @param string $value     Raw caller input.
+     * @param string $value     Raw caller- or provider-supplied text.
      * @param int    $maxLength Byte budget for the excerpt.
      *
      * @return string Single-line bounded excerpt (`'...'`-marked when
@@ -2479,7 +2579,9 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             return $collapsed;
         }
 
-        return rtrim(substr($collapsed, 0, $maxLength)) . '...';
+        // mb_strcut keeps the byte budget but never splits a UTF-8 sequence,
+        // so a cut through provider-supplied multibyte text stays valid.
+        return rtrim(mb_strcut($collapsed, 0, $maxLength, 'UTF-8')) . '...';
     }
 
     /**

@@ -979,6 +979,345 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertCount(2, $history, 'a stale (unparsable-window) reset must NOT block the network — honest retry');
     }
 
+    // ---------------------------------------------------------------------
+    // OSB-3 / OSB-4: provider-supplied data containment. API `message` /
+    // `reset_time_utc` cross the log/throw boundary only as bounded
+    // single-line excerpts (classification still reads the raw value), and
+    // both latch horizons are clamped so one hostile response cannot park
+    // the provider until restart.
+    // ---------------------------------------------------------------------
+
+    /**
+     * @return list<array{0:string, 1:string}>
+     */
+    public static function hostileRetryAfterProvider(): array
+    {
+        return [
+            'decade delta-seconds' => ['315360000', 'delta'],
+            'int-overflowing delta-seconds' => ['99999999999999999999999', 'delta'],
+            'far-future HTTP-date' => ['Fri, 01 Jan 2100 00:00:00 GMT', 'date'],
+        ];
+    }
+
+    /**
+     * @dataProvider hostileRetryAfterProvider
+     */
+    public function test_hostile_retry_after_is_clamped_and_redials_after_the_clamp(string $retryAfter, string $kind): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $logger = $this->levelRecorder();
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(429, '{"message":"Too Many Requests"}', ['Retry-After' => $retryAfter]),
+            self::response(500, '{"message":"upstream"}'),
+        ], $history);
+
+        $provider->onEnable($this->containerFor($logger));
+
+        try {
+            $provider->downloadRaw(1);
+            $this->fail('Expected the 429 to surface as a failure.');
+        } catch (OpenSubtitlesException $e) {
+            $this->assertStringContainsString('Download failed', $e->getMessage());
+        }
+
+        $until = $this->privateProperty($provider, 'rateLimitedUntil');
+        $this->assertIsInt($until, "a {$kind} window beyond the clamp still latches (clamped), never nothing");
+        $this->assertGreaterThan(time(), $until);
+        $this->assertLessThanOrEqual(time() + self::maxLatchWindow(), $until, 'latch must never exceed the clamp');
+        $this->assertTrue($logger->has('warning', 'beyond the local clamp'), 'the clamp must be logged loudly');
+
+        // Inside the clamped window: refused locally, zero dials.
+        try {
+            $provider->downloadRaw(2);
+            $this->fail('Expected the clamped window to refuse locally.');
+        } catch (OpenSubtitlesException $e) {
+            $this->assertStringContainsString('rate-limited', $e->getMessage());
+        }
+        $this->assertCount(1, $history);
+
+        // The clamp lapses: the next call re-dials for an honest answer.
+        $this->setPrivateProperty($provider, 'rateLimitedUntil', time() - 1);
+
+        try {
+            $provider->downloadRaw(3);
+            $this->fail('Expected the re-dialed 500 to surface.');
+        } catch (OpenSubtitlesException $e) {
+            $this->assertStringContainsString('Download failed', $e->getMessage());
+        }
+        $this->assertCount(2, $history, 'after the clamp the provider must dial again, never stay parked');
+    }
+
+    public function test_honest_retry_after_inside_the_clamp_is_kept_exactly(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $logger = $this->levelRecorder();
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(429, '{"message":"slow down"}', ['Retry-After' => '120']),
+        ], $history);
+
+        $provider->onEnable($this->containerFor($logger));
+
+        $before = time();
+        try {
+            $provider->searchByImdbIdRaw('tt1');
+            $this->fail('Expected the 429 to surface as a failure.');
+        } catch (OpenSubtitlesException) {
+        }
+        $after = time();
+
+        $until = $this->privateProperty($provider, 'rateLimitedUntil');
+        $this->assertIsInt($until);
+        $this->assertGreaterThanOrEqual($before + 120, $until);
+        $this->assertLessThanOrEqual($after + 120, $until);
+        $this->assertFalse($logger->has('warning', 'beyond the local clamp'), 'an honest window is not clamped');
+    }
+
+    public function test_far_future_quota_reset_is_clamped_and_redials_after_the_clamp(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $logger = $this->levelRecorder();
+
+        $quotaBody = (string) json_encode([
+            'remaining' => 0,
+            'reset_time_utc' => '2999-12-31T23:59:59Z',
+            'message' => 'You have downloaded your allowed 20 subtitles for 24h.',
+        ]);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, $quotaBody),
+            self::response(200, $quotaBody),
+        ], $history);
+
+        $provider->onEnable($this->containerFor($logger));
+
+        try {
+            $provider->downloadRaw(1);
+            $this->fail('Expected OpenSubtitlesQuotaExceededException.');
+        } catch (OpenSubtitlesQuotaExceededException $e) {
+            $this->assertSame('2999-12-31T23:59:59Z', $e->resetTimeUtc, 'the API field is surfaced as-is when benign');
+        }
+
+        $until = $this->privateProperty($provider, 'quotaBlockedUntil');
+        $this->assertIsInt($until);
+        $this->assertGreaterThan(time(), $until);
+        $this->assertLessThanOrEqual(time() + self::maxLatchWindow(), $until, 'quota latch must never exceed the clamp');
+        $this->assertTrue($logger->has('warning', 'download-quota window beyond the local clamp'));
+
+        try {
+            $provider->downloadRaw(2);
+            $this->fail('Expected the clamped quota window to refuse locally.');
+        } catch (OpenSubtitlesQuotaExceededException $e) {
+            $this->assertStringContainsString('not retried locally', $e->getMessage());
+        }
+        $this->assertCount(1, $history);
+
+        $this->setPrivateProperty($provider, 'quotaBlockedUntil', time() - 1);
+
+        try {
+            $provider->downloadRaw(3);
+            $this->fail('Expected the re-dialed quota answer.');
+        } catch (OpenSubtitlesQuotaExceededException $e) {
+            $this->assertStringNotContainsString('not retried locally', $e->getMessage());
+        }
+        $this->assertCount(2, $history, 'after the clamp the quota latch must re-dial for an honest answer');
+    }
+
+    public function test_quota_4xx_message_is_excerpted_at_log_and_throw_but_classified_raw(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $logger = $this->levelRecorder();
+
+        // The quota keyword sits PAST the excerpt budget: classification must
+        // still see it (raw match), while the surfaced text stays bounded.
+        $message = "FORGED\r\nlog line " . str_repeat('padding ', 100) . 'download quota exceeded';
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(406, (string) json_encode([
+                'message' => $message,
+                'reset_time_utc' => "2026-07-13T23:59:59Z\nFORGED",
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->containerFor($logger));
+
+        try {
+            $provider->downloadRaw(1);
+            $this->fail('Expected OpenSubtitlesQuotaExceededException (raw-value classification).');
+        } catch (OpenSubtitlesQuotaExceededException $e) {
+            $this->assertSingleLineBounded($e->getMessage(), self::apiMessageBudget());
+            $this->assertStringStartsWith('FORGED log line padding', $e->getMessage());
+            $this->assertStringNotContainsString('quota', $e->getMessage(), 'the keyword lies beyond the excerpt');
+            $this->assertSame('2026-07-13T23:59:59Z FORGED', $e->resetTimeUtc);
+        }
+
+        $this->assertNotSame([], $logger->records);
+        foreach ($logger->records as [, $line]) {
+            $this->assertSingleLineBounded($line, self::apiMessageBudget() + 64);
+        }
+    }
+
+    public function test_non_quota_4xx_message_is_excerpted_in_the_generic_failure(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $logger = $this->levelRecorder();
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(400, (string) json_encode(['message' => "bad\nrequest\x1b[31m" . str_repeat('A', 5000)])),
+        ], $history);
+
+        $provider->onEnable($this->containerFor($logger));
+
+        try {
+            $provider->downloadRaw(1);
+            $this->fail('Expected a generic download failure.');
+        } catch (OpenSubtitlesException $e) {
+            $this->assertNotInstanceOf(OpenSubtitlesQuotaExceededException::class, $e);
+            $this->assertStringStartsWith('Download failed: bad request', $e->getMessage());
+            $this->assertSingleLineBounded($e->getMessage(), strlen('Download failed: ') + self::apiMessageBudget());
+            $this->assertStringNotContainsString("\x1b", $e->getMessage());
+        }
+
+        $this->assertTrue($logger->has('error', 'Download failed') || $logger->has('error', 'download failed'));
+        foreach ($logger->records as [, $line]) {
+            $this->assertSingleLineBounded($line, self::apiMessageBudget() + 64);
+        }
+    }
+
+    public function test_whitespace_only_api_message_falls_back_to_the_http_status(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(400, (string) json_encode(['message' => "\n\t \r\n"])),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $this->expectException(OpenSubtitlesException::class);
+        $this->expectExceptionMessage('Download failed: HTTP 400');
+        $provider->downloadRaw(1);
+    }
+
+    public function test_remembered_quota_context_is_excerpted_in_every_local_refusal(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $logger = $this->levelRecorder();
+
+        $future = gmdate('Y-m-d\TH:i:s\Z', time() + 3600);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(200, (string) json_encode([
+                'remaining' => 0,
+                'reset_time' => "in an hour\nFORGED " . str_repeat('t', 500),
+                'reset_time_utc' => $future,
+                'message' => "Quota gone\r\nFORGED " . str_repeat('m', 5000),
+            ])),
+        ], $history);
+
+        $provider->onEnable($this->containerFor($logger));
+
+        foreach ([1, 2] as $fileId) {
+            try {
+                $provider->downloadRaw($fileId);
+                $this->fail('Expected OpenSubtitlesQuotaExceededException.');
+            } catch (OpenSubtitlesQuotaExceededException $e) {
+                $this->assertStringStartsWith('Quota gone FORGED mmm', $e->getMessage());
+                $this->assertSingleLineBounded($e->getMessage(), self::apiMessageBudget() + 64);
+                $this->assertNotNull($e->resetTime);
+                $this->assertSingleLineBounded($e->resetTime, 64 + 3);
+                $this->assertSame($future, $e->resetTimeUtc);
+            }
+        }
+
+        $this->assertCount(1, $history, 'the second call is the remembered local refusal');
+        foreach ($logger->records as [, $line]) {
+            $this->assertSingleLineBounded($line, self::apiMessageBudget() + 64);
+        }
+    }
+
+    public function test_safe_message_excerpt_never_splits_a_utf8_sequence(): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'safeMessageExcerpt');
+
+        // 'é' is 2 bytes: a 5-byte budget lands mid-sequence on a naive cut.
+        $excerpt = $method->invoke(null, str_repeat('é', 10), 5);
+        $this->assertIsString($excerpt);
+        $this->assertTrue(mb_check_encoding($excerpt, 'UTF-8'), 'the excerpt must stay valid UTF-8');
+        $this->assertSame('éé...', $excerpt);
+    }
+
+    /**
+     * Assert `$value` is one line (no CR/LF/control bytes) within `$maxBytes`.
+     */
+    private function assertSingleLineBounded(string $value, int $maxBytes): void
+    {
+        $this->assertDoesNotMatchRegularExpression('/[\x00-\x1F\x7F]/', $value, 'no control bytes / forged lines');
+        $this->assertLessThanOrEqual($maxBytes, strlen($value), 'excerpt must stay within its byte budget');
+    }
+
+    private static function maxLatchWindow(): int
+    {
+        $value = (new \ReflectionClassConstant(OpenSubtitlesProvider::class, 'MAX_LATCH_WINDOW_SEC'))->getValue();
+        self::assertIsInt($value);
+        self::assertLessThanOrEqual(172_800, $value, 'the latch clamp must stay within 48h');
+
+        return $value;
+    }
+
+    private static function apiMessageBudget(): int
+    {
+        $value = (new \ReflectionClassConstant(OpenSubtitlesProvider::class, 'API_MESSAGE_EXCERPT_BYTES'))->getValue();
+        self::assertIsInt($value);
+
+        // Budget + the '...' truncation marker.
+        return $value + 3;
+    }
+
+    private function privateProperty(OpenSubtitlesProvider $provider, string $name): mixed
+    {
+        return (new \ReflectionProperty(OpenSubtitlesProvider::class, $name))->getValue($provider);
+    }
+
+    private function setPrivateProperty(OpenSubtitlesProvider $provider, string $name, mixed $value): void
+    {
+        (new \ReflectionProperty(OpenSubtitlesProvider::class, $name))->setValue($provider, $value);
+    }
+
+    /**
+     * A PSR-3 logger that records every (level, message) pair.
+     *
+     * @return \Psr\Log\AbstractLogger&object{records: list<array{0:string, 1:string}>}
+     */
+    private function levelRecorder(): \Psr\Log\AbstractLogger
+    {
+        return new class extends \Psr\Log\AbstractLogger {
+            /** @var list<array{0:string, 1:string}> */
+            public array $records = [];
+
+            public function log($level, \Stringable|string $message, array $context = []): void
+            {
+                $this->records[] = [(string) $level, (string) $message];
+            }
+
+            public function has(string $level, string $needle): bool
+            {
+                foreach ($this->records as [$recordLevel, $line]) {
+                    if ($recordLevel === $level && str_contains($line, $needle)) {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+        };
+    }
+
     public function test_header_value_reads_lists_and_scalars_case_insensitively(): void
     {
         $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'headerValue');
