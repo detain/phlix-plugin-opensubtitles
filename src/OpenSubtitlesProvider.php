@@ -23,7 +23,9 @@ use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 use RuntimeException;
 use Throwable;
+use Workerman\Connection\AsyncTcpConnection;
 use Workerman\Http\Client;
+use Workerman\Http\ConnectionPool;
 use Workerman\Http\Response;
 
 /**
@@ -165,6 +167,22 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     private const HTTP_TIMEOUT_SEC = 30;
 
     /**
+     * Most distinct target hosts the process-scoped HTTP client map
+     * ({@see $httpClients}) retains at once.
+     *
+     * The step-2 download link is response-supplied, so its host can rotate
+     * across CDN subdomains inside the trust domain indefinitely; without a
+     * bound every new name would pin one more client (and its pool, timer
+     * and keep-alive sockets) for the life of the worker. Eight covers the
+     * fixed API origin plus a working set of download hosts with room to
+     * spare; past it the least-recently-used idle host is evicted
+     * ({@see httpClientFor()}).
+     *
+     * @since 0.6.1
+     */
+    private const MAX_HTTP_CLIENT_HOSTS = 8;
+
+    /**
      * Hard cap (bytes) on any single HTTP response body — search/login/link
      * JSON and downloaded subtitle content alike.
      *
@@ -275,9 +293,40 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * right `peer_name`/SNI identity for every host this plugin dials
      * (see {@see httpClientFor()}).
      *
+     * Bounded: an LRU map of at most {@see MAX_HTTP_CLIENT_HOSTS} hosts,
+     * ordered by {@see $httpClientLastUse}; a host with a request in flight
+     * ({@see $httpClientsInFlight}) is never evicted.
+     *
      * @var array<string,Client>
      */
     private array $httpClients = [];
+
+    /**
+     * Recency stamp per cached host: the value of {@see $httpClientClock} at
+     * that host's latest {@see httpClientFor()} call. The smallest stamp
+     * among idle hosts is the eviction victim.
+     *
+     * @var array<string,int>
+     */
+    private array $httpClientLastUse = [];
+
+    /**
+     * Logical use-clock behind {@see $httpClientLastUse}: incremented once
+     * per {@see httpClientFor()} call. A counter rather than wall time, so
+     * recency is a strict total order (no same-tick ties) and immune to
+     * clock steps.
+     */
+    private int $httpClientClock = 0;
+
+    /**
+     * Requests currently awaiting a response, per target host. Maintained by
+     * {@see httpRequest()} around the dial and the cooperative wait (released
+     * in a `finally`), so a host another coroutine is still waiting on is
+     * never chosen for eviction. Hosts with no request in flight are absent.
+     *
+     * @var array<string,int>
+     */
+    private array $httpClientsInFlight = [];
 
     /**
      * Test seam replacing the network call. Signature:
@@ -560,7 +609,12 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * instance (i.e. the worker process), so a disable/enable cycle reuses the
      * already-built strict-TLS clients instead of rebuilding them. The pool
      * holds no credentials or session state — only connection plumbing — and
-     * which hosts it retains is governed solely by {@see httpClientFor()}.
+     * which hosts it retains is governed solely by {@see httpClientFor()}: a
+     * least-recently-used map capped at {@see MAX_HTTP_CLIENT_HOSTS} distinct
+     * hosts, so "process-scoped" bounds the pool's lifetime, never its size.
+     * An individual host's client lives until it is evicted (its idle
+     * sockets closed) or the worker exits; a host with a request in flight
+     * is never evicted.
      *
      * @return void
      *
@@ -1894,15 +1948,34 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             $options['data'] = $body;
         }
 
-        $this->httpClientFor($url)->request($url, $options);
+        $client = $this->httpClientFor($url);
+        $host = self::requestHost($url);
 
-        // Cooperative wait — yields to the event loop (Swoole coroutine hooks
-        // make usleep yield), allowing other tasks to proceed meanwhile.
-        $maxWait = self::HTTP_TIMEOUT_SEC + 1.0;
-        $waited = 0.0;
-        while (!$state['done'] && $waited < $maxWait) {
-            usleep(10_000); // 10ms
-            $waited += 0.01;
+        // Mark the host in flight for the dial and the whole cooperative
+        // wait: other coroutines may churn the client map meanwhile, and the
+        // LRU bound must never evict (and close) the client this request is
+        // riding. Nothing between httpClientFor() and this line yields.
+        $this->httpClientsInFlight[$host] = ($this->httpClientsInFlight[$host] ?? 0) + 1;
+
+        try {
+            $client->request($url, $options);
+
+            // Cooperative wait — yields to the event loop (Swoole coroutine hooks
+            // make usleep yield), allowing other tasks to proceed meanwhile.
+            $maxWait = self::HTTP_TIMEOUT_SEC + 1.0;
+            $waited = 0.0;
+            while (!$state['done'] && $waited < $maxWait) {
+                usleep(10_000); // 10ms
+                $waited += 0.01;
+            }
+        } finally {
+            // Present: marked above and only ever released by its own marker.
+            $remaining = $this->httpClientsInFlight[$host] - 1;
+            if ($remaining > 0) {
+                $this->httpClientsInFlight[$host] = $remaining;
+            } else {
+                unset($this->httpClientsInFlight[$host]);
+            }
         }
 
         if ($state['error'] instanceof Throwable) {
@@ -2335,26 +2408,151 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     }
 
     /**
-     * The shared non-blocking HTTP client for the target host of `$url`,
-     * created lazily with strict TLS verification ({@see strictTlsContext()}).
+     * The target host of `$url` — the key of the per-host client map.
      *
      * @throws OpenSubtitlesException When the URL carries no host to verify.
+     *
+     * @since 0.6.1
      */
-    private function httpClientFor(string $url): Client
+    private static function requestHost(string $url): string
     {
         $host = parse_url($url, PHP_URL_HOST);
         if (!is_string($host) || $host === '') {
             throw new OpenSubtitlesException('HTTP request URL carries no host to verify: ' . $url);
         }
 
+        return $host;
+    }
+
+    /**
+     * The shared non-blocking HTTP client for the target host of `$url`,
+     * created lazily with strict TLS verification ({@see strictTlsContext()}).
+     *
+     * Every call stamps the host on the logical use-clock. Admitting a NEW
+     * host while {@see MAX_HTTP_CLIENT_HOSTS} are cached first evicts the
+     * least-recently-used host that has no request in flight
+     * ({@see evictLeastRecentlyUsedHttpClient()}). When every cached host is
+     * in flight the newcomer is admitted over the cap rather than tearing a
+     * live request's client away; the next admission after those requests
+     * settle trims the map back to the cap.
+     *
+     * @throws OpenSubtitlesException When the URL carries no host to verify.
+     */
+    private function httpClientFor(string $url): Client
+    {
+        $host = self::requestHost($url);
+
         if (!isset($this->httpClients[$host])) {
+            while (count($this->httpClients) >= self::MAX_HTTP_CLIENT_HOSTS) {
+                if (!$this->evictLeastRecentlyUsedHttpClient()) {
+                    break;
+                }
+            }
+
             $this->httpClients[$host] = new Client([
                 'timeout' => self::HTTP_TIMEOUT_SEC,
                 'context' => ['ssl' => self::strictTlsContext($host)],
             ]);
         }
 
+        $this->httpClientLastUse[$host] = ++$this->httpClientClock;
+
         return $this->httpClients[$host];
+    }
+
+    /**
+     * Evict the least-recently-used cached host that has no request in
+     * flight, closing its client's idle sockets ({@see closeHttpClient()}).
+     *
+     * @return bool False when every cached host is in flight (nothing evicted).
+     *
+     * @since 0.6.1
+     */
+    private function evictLeastRecentlyUsedHttpClient(): bool
+    {
+        $victim = null;
+        $oldest = PHP_INT_MAX;
+        foreach (array_keys($this->httpClients) as $host) {
+            if (($this->httpClientsInFlight[$host] ?? 0) > 0) {
+                continue;
+            }
+
+            $lastUse = $this->httpClientLastUse[$host] ?? 0;
+            if ($lastUse < $oldest) {
+                $oldest = $lastUse;
+                $victim = $host;
+            }
+        }
+
+        if ($victim === null) {
+            return false;
+        }
+
+        $client = $this->httpClients[$victim];
+        unset($this->httpClients[$victim], $this->httpClientLastUse[$victim]);
+        self::closeHttpClient($client);
+
+        $this->logger->debug('OpenSubtitles HTTP client pool evicted its least-recently-used host', [
+            'host' => $victim,
+            'cap' => self::MAX_HTTP_CLIENT_HOSTS,
+        ]);
+
+        return true;
+    }
+
+    /**
+     * Close an evicted client's idle keep-alive sockets now.
+     *
+     * The vendored `workerman/http-client` v3.1.3 `Client` exposes no close
+     * API, so this reaches its pool's idle set the same way the pool's own
+     * keepalive reaper does (`delete()` then `close()`; recycled idle
+     * sockets carry no callbacks, so closing them fires nothing). Only idle
+     * sockets are touched: an evicted host has no request in flight by
+     * construction, and a socket a timed-out request abandoned is reaped by
+     * the pool's own timeout timer, after which that timer deletes itself
+     * and the client is garbage. Should a future vendor version reshape
+     * these internals, this degrades to exactly that self-reaping, never to
+     * an error.
+     *
+     * @return int Number of idle sockets closed.
+     *
+     * @since 0.6.1
+     */
+    private static function closeHttpClient(Client $client): int
+    {
+        try {
+            $pool = (new \ReflectionProperty(Client::class, '_connectionPool'))->getValue($client);
+            if (!$pool instanceof ConnectionPool) {
+                return 0;
+            }
+
+            $idle = (new \ReflectionProperty(ConnectionPool::class, 'idle'))->getValue($pool);
+        } catch (\ReflectionException) {
+            return 0;
+        }
+
+        if (!is_array($idle)) {
+            return 0;
+        }
+
+        $closed = 0;
+        foreach ($idle as $connections) {
+            if (!is_array($connections)) {
+                continue;
+            }
+
+            foreach ($connections as $connection) {
+                if (!$connection instanceof AsyncTcpConnection) {
+                    continue;
+                }
+
+                $pool->delete($connection);
+                $connection->close();
+                $closed++;
+            }
+        }
+
+        return $closed;
     }
 
     /**

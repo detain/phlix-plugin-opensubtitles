@@ -3939,6 +3939,216 @@ final class OpenSubtitlesProviderTest extends TestCase
     }
 
     // ---------------------------------------------------------------------
+    // Per-host HTTP client pool bound (OSSR-S8 / OSB-16) — the process-scoped
+    // map is an LRU capped at MAX_HTTP_CLIENT_HOSTS distinct hosts, ordered
+    // by a deterministic logical use-clock (never wall time), closing the
+    // evicted host's idle sockets and never evicting a host in flight.
+    // ---------------------------------------------------------------------
+
+    private static function httpClientHostCap(): int
+    {
+        $cap = (new \ReflectionClassConstant(OpenSubtitlesProvider::class, 'MAX_HTTP_CLIENT_HOSTS'))->getValue();
+        self::assertIsInt($cap);
+        self::assertGreaterThanOrEqual(2, $cap, 'the cap must leave room for the API origin plus a link host');
+
+        return $cap;
+    }
+
+    private static function dialHost(OpenSubtitlesProvider $provider, string $host): \Workerman\Http\Client
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'httpClientFor');
+
+        /** @var \Workerman\Http\Client */
+        return $method->invoke($provider, 'https://' . $host . '/download/x.srt');
+    }
+
+    /**
+     * @return array<string, \Workerman\Http\Client>
+     */
+    private static function cachedClients(OpenSubtitlesProvider $provider): array
+    {
+        /** @var array<string, \Workerman\Http\Client> */
+        return (new \ReflectionProperty(OpenSubtitlesProvider::class, 'httpClients'))->getValue($provider);
+    }
+
+    /**
+     * @return array<string, int>
+     */
+    private static function inFlightLedger(OpenSubtitlesProvider $provider): array
+    {
+        /** @var array<string, int> */
+        return (new \ReflectionProperty(OpenSubtitlesProvider::class, 'httpClientsInFlight'))->getValue($provider);
+    }
+
+    /**
+     * Forever-rotating download subdomains must not grow the process map
+     * without bound: past the cap the least-recently-USED host goes — a
+     * cache hit re-stamps recency, so this is LRU, not insertion-order FIFO.
+     */
+    public function test_http_client_pool_is_capped_and_evicts_the_least_recently_used_host(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $cap = self::httpClientHostCap();
+
+        $first = self::dialHost($provider, 'cdn0.opensubtitles.org');
+        for ($i = 1; $i < $cap; $i++) {
+            self::dialHost($provider, "cdn{$i}.opensubtitles.org");
+        }
+        $this->assertCount($cap, self::cachedClients($provider), 'filling to the cap evicts nothing');
+
+        // Deterministic use-clock: one strictly increasing tick per dial.
+        $clock = (new \ReflectionProperty(OpenSubtitlesProvider::class, 'httpClientLastUse'))->getValue($provider);
+        $this->assertSame(range(1, $cap), array_values((array) $clock));
+
+        // Re-use the oldest host: a hit returns the same client and re-stamps it.
+        $this->assertSame($first, self::dialHost($provider, 'cdn0.opensubtitles.org'));
+
+        self::dialHost($provider, 'rotated.opensubtitles.org');
+
+        $clients = self::cachedClients($provider);
+        $this->assertCount($cap, $clients, 'a new host past the cap must evict, never grow the map');
+        $this->assertArrayHasKey('cdn0.opensubtitles.org', $clients, 'the re-used host is recent, not evictable');
+        $this->assertArrayNotHasKey('cdn1.opensubtitles.org', $clients, 'the least-recently-used host is evicted');
+        $this->assertArrayHasKey('rotated.opensubtitles.org', $clients);
+
+        $clock = (array) (new \ReflectionProperty(OpenSubtitlesProvider::class, 'httpClientLastUse'))->getValue($provider);
+        $this->assertArrayNotHasKey('cdn1.opensubtitles.org', $clock, 'the evicted host leaves no recency residue');
+        $this->assertCount($cap, $clock);
+
+        // Keep rotating: the map stays bounded however many hosts pass through.
+        for ($i = 0; $i < 3 * $cap; $i++) {
+            self::dialHost($provider, "spin{$i}.opensubtitles.org");
+        }
+        $this->assertCount($cap, self::cachedClients($provider));
+    }
+
+    /**
+     * Eviction skips any host with a request in flight (the next-oldest idle
+     * host goes instead); when EVERY cached host is in flight the newcomer is
+     * admitted over the cap rather than tearing a live request's client away,
+     * and the map trims back to the cap once those requests settle.
+     */
+    public function test_http_client_pool_never_evicts_a_host_with_a_request_in_flight(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $cap = self::httpClientHostCap();
+        $ledger = new \ReflectionProperty(OpenSubtitlesProvider::class, 'httpClientsInFlight');
+
+        for ($i = 0; $i < $cap; $i++) {
+            self::dialHost($provider, "cdn{$i}.opensubtitles.org");
+        }
+
+        // The LRU host is mid-request: the next-oldest idle host is the victim.
+        $ledger->setValue($provider, ['cdn0.opensubtitles.org' => 1]);
+        self::dialHost($provider, 'new0.opensubtitles.org');
+        $clients = self::cachedClients($provider);
+        $this->assertArrayHasKey('cdn0.opensubtitles.org', $clients, 'an in-flight host must never be evicted');
+        $this->assertArrayNotHasKey('cdn1.opensubtitles.org', $clients);
+        $this->assertCount($cap, $clients);
+
+        // Every cached host in flight: admit over the cap, evict nothing.
+        $all = [];
+        foreach (array_keys($clients) as $host) {
+            $all[$host] = 1;
+        }
+        $ledger->setValue($provider, $all);
+        self::dialHost($provider, 'new1.opensubtitles.org');
+        $clients = self::cachedClients($provider);
+        $this->assertCount($cap + 1, $clients, 'no live request loses its client to the cap');
+        foreach (array_keys($all) as $host) {
+            $this->assertArrayHasKey($host, $clients);
+        }
+
+        // Requests settled: the next newcomer trims the map back to the cap.
+        $ledger->setValue($provider, []);
+        self::dialHost($provider, 'new2.opensubtitles.org');
+        $this->assertCount($cap, self::cachedClients($provider));
+    }
+
+    /**
+     * Wire-path proof of the in-flight ledger: while httpRequest() is waiting
+     * on the API origin (made the least-recently-used host), another
+     * coroutine churning through cap-many new hosts must not evict it; the
+     * ledger is released once the request settles — on success AND on a
+     * transport failure.
+     */
+    public function test_http_request_marks_its_host_in_flight_until_the_request_settles(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $provider->onEnable($this->stubContainer());
+        $cap = self::httpClientHostCap();
+
+        $recorder = $this->installRecordingHttpClient($provider);
+        $seen = [];
+        $recorder->duringRequest = function (string $url) use ($provider, $cap, &$seen): void {
+            $seen[] = self::inFlightLedger($provider);
+            for ($i = 0; $i < $cap; $i++) {
+                self::dialHost($provider, 'churn' . count($seen) . "-{$i}.opensubtitles.org");
+            }
+        };
+
+        $recorder->pending[] = new \Workerman\Http\Response(200, [], '{"data":[]}');
+        $provider->searchByImdbIdRaw('tt1234567');
+
+        $this->assertSame([['api.opensubtitles.com' => 1]], $seen, 'the dialed host is in flight during the wait');
+        $this->assertSame($recorder, self::cachedClients($provider)['api.opensubtitles.com'] ?? null, 'an in-flight host survives churn');
+        $this->assertSame([], self::inFlightLedger($provider), 'the ledger is released after success');
+
+        $recorder->pending[] = new \RuntimeException('connection reset');
+        try {
+            $provider->searchByImdbIdRaw('tt1234567');
+            $this->fail('a transport failure must surface');
+        } catch (OpenSubtitlesException) {
+        }
+        $this->assertSame([], self::inFlightLedger($provider), 'the ledger is released after a transport failure');
+    }
+
+    /**
+     * Eviction closes the evicted client's idle keep-alive sockets now
+     * rather than leaving them to the vendor's keepalive timer; the surviving
+     * clients' sockets are untouched.
+     */
+    public function test_evicted_http_client_has_its_idle_connections_closed(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $cap = self::httpClientHostCap();
+
+        $idleSocket = function (bool $expectClose, int $id): \Workerman\Connection\AsyncTcpConnection {
+            $connection = $this->getMockBuilder(\Workerman\Connection\AsyncTcpConnection::class)
+                ->disableOriginalConstructor()
+                ->onlyMethods(['close'])
+                ->getMock();
+            $connection->expects($expectClose ? $this->once() : $this->never())->method('close');
+            $connection->id = $id;
+            $connection->address = 'idle:443';
+
+            return $connection;
+        };
+        $poolOf = static function (\Workerman\Http\Client $client): \Workerman\Http\ConnectionPool {
+            $pool = (new \ReflectionProperty(\Workerman\Http\Client::class, '_connectionPool'))->getValue($client);
+            self::assertInstanceOf(\Workerman\Http\ConnectionPool::class, $pool);
+
+            return $pool;
+        };
+        $idle = new \ReflectionProperty(\Workerman\Http\ConnectionPool::class, 'idle');
+
+        $victimPool = $poolOf(self::dialHost($provider, 'victim.opensubtitles.org'));
+        $idle->setValue($victimPool, ['idle:443' => [1 => $idleSocket(true, 1), 2 => $idleSocket(true, 2)]]);
+
+        $survivorPool = $poolOf(self::dialHost($provider, 'survivor.opensubtitles.org'));
+        $idle->setValue($survivorPool, ['idle:443' => [3 => $idleSocket(false, 3)]]);
+
+        for ($i = 2; $i < $cap; $i++) {
+            self::dialHost($provider, "cdn{$i}.opensubtitles.org");
+        }
+        self::dialHost($provider, 'newcomer.opensubtitles.org');
+
+        $this->assertArrayNotHasKey('victim.opensubtitles.org', self::cachedClients($provider));
+        $this->assertSame([], $idle->getValue($victimPool), 'closed sockets are removed from the evicted pool');
+        $this->assertCount(1, (array) $idle->getValue($survivorPool)['idle:443']);
+    }
+
+    // ---------------------------------------------------------------------
     // Redirect refusal — a response-named Location must never be dialed with
     // the Api-Key / Bearer headers riding along. The credential-custody law
     // of isApiOrigin() (the API origin is the ONLY host that ever sees the
@@ -4183,6 +4393,13 @@ final class OpenSubtitlesProviderTest extends TestCase
             /** @var list<\Workerman\Http\Response|\Throwable> */
             public array $pending = [];
 
+            /**
+             * Optional hook run while the dial is "on the wire" (before the
+             * canned response is delivered) — stands in for whatever another
+             * coroutine does to the provider during the cooperative wait.
+             */
+            public ?\Closure $duringRequest = null;
+
             /** Skips the parent constructor on purpose: no pool, no event loop. */
             public function __construct(array $options = [])
             {
@@ -4191,6 +4408,10 @@ final class OpenSubtitlesProviderTest extends TestCase
             public function request(string $url, array $options = []): mixed
             {
                 $this->dials[] = ['url' => $url, 'options' => $options];
+
+                if ($this->duringRequest !== null) {
+                    ($this->duringRequest)($url);
+                }
 
                 $next = array_shift($this->pending);
 
