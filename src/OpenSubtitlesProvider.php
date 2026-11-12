@@ -2526,10 +2526,10 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
 
             $format = $row['format'] !== '' ? $row['format'] : self::DEFAULT_FORMAT;
 
-            // No language fallback here: the parse boundary in the `*Raw`
-            // result mapper is the single source of that law — rows without a
-            // usable (trimmed, non-empty) language were already skipped there,
-            // never relabeled a default.
+            // No language fallback here: the parse boundary in
+            // {@see filterSubtitles()} is the single source of that law — rows
+            // without a usable (trimmed, non-empty) language were already
+            // skipped there, never relabeled a default.
             $candidates[] = new SubtitleCandidate(
                 provider: self::SOURCE_NAME,
                 language: $row['language'],
