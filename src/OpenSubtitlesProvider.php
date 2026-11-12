@@ -1052,8 +1052,22 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     {
         $this->ensureEnabled();
 
+        // The candidate's download id is a string; a bare `(int)` cast would
+        // saturate an over-long digit run to PHP_INT_MAX and truncate a
+        // digit-prefixed string to its prefix — positive ids that pass
+        // downloadRaw()'s sign check and spend quota on a file the candidate
+        // never named. Only an exact, in-range integer spelling proceeds; the
+        // sign check stays single-sourced in downloadRaw().
+        $fileId = self::intOrNull($candidate->downloadId);
+        if ($fileId === null) {
+            throw new OpenSubtitlesException(
+                'OpenSubtitles download rejected: file id must be a positive integer, got \''
+                    . self::safeMessageExcerpt($candidate->downloadId) . '\'',
+            );
+        }
+
         try {
-            $raw = $this->downloadRaw((int) $candidate->downloadId);
+            $raw = $this->downloadRaw($fileId);
         } catch (OpenSubtitlesQuotaExceededException $e) {
             throw new QuotaExceeded(
                 $e->getMessage(),
@@ -2768,9 +2782,15 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
     /**
      * Derive a safe base filename (no directory component, no control chars,
      * never a degenerate `.`/`..` token) for a downloaded subtitle, ensuring
-     * it carries the subtitle format extension. Both source branches — the
+     * it carries a file extension. Both source branches — the
      * provider-reported name and the composed release/format/language
      * fallback — pass through one scrub and the one degenerate-name guard.
+     *
+     * A provider-reported name that already carries an extension (as
+     * `pathinfo()` reads one) is kept verbatim — it is not rewritten to
+     * `$format`; an extensionless provider name gains `.$format` (or the
+     * default format when `$format` is empty). The fallback branch always
+     * ends in `.$format`.
      *
      * @param string      $providerName Provider-reported file name (may be empty).
      * @param string|null $releaseName  Candidate release name fallback.
@@ -2803,6 +2823,11 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             // The fallback interpolates configured format/language and
             // API-reported values — none validated upstream — so it gets the
             // same single scrub the provider branch received.
+            $base = (string) preg_replace('#[\x00-\x1F/\\\\]+#', '', $base);
+        } elseif (pathinfo($base, PATHINFO_EXTENSION) === '') {
+            // An extensionless provider name still gets a format extension;
+            // the appended format is unvalidated, so it is scrubbed too.
+            $base .= '.' . ($format !== '' ? $format : self::DEFAULT_FORMAT);
             $base = (string) preg_replace('#[\x00-\x1F/\\\\]+#', '', $base);
         }
 
@@ -2871,7 +2896,10 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      * and the local window latch for the numeric-string spelling.
      *
      * Integers and integral strings (optional leading sign) coerce; a float, a
-     * fractional string, or anything else reads as null (no value).
+     * fractional string, or anything else reads as null (no value). The
+     * string must be an exact spelling (no trailing newline) of a value inside
+     * the platform int range: an over-long digit run is refused rather than
+     * saturated to PHP_INT_MAX/PHP_INT_MIN the way a bare `(int)` cast would.
      *
      * @param mixed $value Raw value.
      *
@@ -2881,11 +2909,19 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
      */
     private static function intOrNull(mixed $value): ?int
     {
-        return match (true) {
-            is_int($value) => $value,
-            is_string($value) && $value !== '' && preg_match('/^-?\d+$/', $value) === 1 => (int) $value,
-            default => null,
-        };
+        if (is_int($value)) {
+            return $value;
+        }
+
+        if (!is_string($value) || preg_match('/^-?\d+$/D', $value) !== 1 || !is_numeric($value)) {
+            return null;
+        }
+
+        // Numeric-string arithmetic promotes an out-of-range digit run to
+        // float instead of saturating it, so is_int() is the range check.
+        $number = $value + 0;
+
+        return is_int($number) ? $number : null;
     }
 
     /**

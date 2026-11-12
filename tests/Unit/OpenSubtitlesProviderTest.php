@@ -1556,6 +1556,36 @@ final class OpenSubtitlesProviderTest extends TestCase
     }
 
     /**
+     * Hand-derived carry vector: the all-zero golden never overflows the low
+     * 32-bit half, so it cannot see the carry into `$high` — nor a mutant that
+     * swaps the roles of the two little-endian word halves. Here a 131072-byte
+     * file carries the 64-bit LE word 0x00000000FFFFFFFF at offset 0 (head
+     * chunk) and again at offset 65536 (tail chunk); every other byte is zero.
+     *
+     *   size seed               0x0000000000020000
+     *   + head word             0x00000000FFFFFFFF  -> 0x000000010001FFFF
+     *   + tail word             0x00000000FFFFFFFF  -> 0x000000020001FFFE
+     *
+     * Both additions overflow the low half, so the high half is exactly the
+     * two carries. A dropped carry renders `000000000001fffe`; swapped word
+     * roles render `fffffffe00020000`.
+     */
+    public function test_compute_hash_carries_low_half_overflow_into_the_high_half(): void
+    {
+        $content = str_repeat("\0", 131072);
+        $word = "\xFF\xFF\xFF\xFF\x00\x00\x00\x00";
+        $content = substr_replace($content, $word, 0, 8);
+        $content = substr_replace($content, $word, 65536, 8);
+        $file = $this->makeFixture($content);
+
+        try {
+            $this->assertSame('000000020001fffe', OpenSubtitlesProvider::computeMovieHash($file));
+        } finally {
+            unlink($file);
+        }
+    }
+
+    /**
      * The summation must actually contribute: changing a byte inside the first
      * 64 KiB must change the hash (discriminates a broken/no-op accumulator).
      */
@@ -1730,8 +1760,9 @@ final class OpenSubtitlesProviderTest extends TestCase
     }
 
     /**
-     * The contract entry casts the candidate's string download id; a
-     * non-numeric value becomes 0 and must hit the same local refusal.
+     * The contract entry parses the candidate's string download id through
+     * the class's intOrNull(); a non-numeric value is refused locally with
+     * the same positive-integer refusal, before any dial.
      */
     public function test_download_refuses_candidate_with_non_numeric_download_id(): void
     {
@@ -1753,6 +1784,108 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertNotNull($thrown, 'a non-numeric download id must throw');
         $this->assertStringContainsString('positive integer', $thrown->getMessage());
         $this->assertSame([], $history, 'the refusal must not consume the wire');
+    }
+
+    /**
+     * A bare `(int)` cast saturates an over-long digit run to PHP_INT_MAX and
+     * truncates a digit-prefixed string to its prefix — both yield a positive
+     * id that would sail past downloadRaw()'s sign check and spend quota on a
+     * file the candidate never named. The contract entry must refuse any
+     * download id that is not an exact, in-range integer spelling.
+     *
+     * @dataProvider outOfRangeDownloadIdProvider
+     */
+    public function test_download_refuses_out_of_range_or_malformed_download_id_without_dialing(string $downloadId): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        $thrown = null;
+        try {
+            $provider->download(self::candidate($downloadId, 'en', 'srt', 'Movie.2019'));
+        } catch (OpenSubtitlesException $e) {
+            $thrown = $e;
+        }
+
+        $this->assertNotNull($thrown, "download id '{$downloadId}' must be refused");
+        $this->assertStringContainsString('positive integer', $thrown->getMessage());
+        $this->assertSame([], $history, 'the refusal must not consume the wire');
+    }
+
+    /** @return array<string, array{0: string}> */
+    public static function outOfRangeDownloadIdProvider(): array
+    {
+        return [
+            'digit run saturating to PHP_INT_MAX' => ['99999999999999999999'],
+            'one past PHP_INT_MAX' => ['9223372036854775808'],
+            'digit prefix with trailing junk' => ['12abc'],
+            'digit run with trailing newline' => ["12\n"],
+        ];
+    }
+
+    /**
+     * Positive control for the range guard: the largest in-range id still
+     * reaches the wire with its exact value.
+     */
+    public function test_download_posts_an_in_range_max_download_id_verbatim(): void
+    {
+        $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
+        $history = [];
+        $this->installFakeTransport($provider, [
+            self::response(500, '{"message":"boom"}'),
+        ], $history);
+
+        $provider->onEnable($this->stubContainer());
+
+        try {
+            $provider->download(self::candidate((string) PHP_INT_MAX, 'en', 'srt', 'Movie.2019'));
+            $this->fail('the canned 500 must fail the download');
+        } catch (OpenSubtitlesException) {
+            // expected — only the wire shape matters here
+        }
+
+        $posts = array_values(array_filter(
+            $history,
+            static fn (array $request): bool => str_ends_with($request['url'], '/download'),
+        ));
+        $this->assertCount(1, $posts);
+        $this->assertStringContainsString('"file_id":' . PHP_INT_MAX, (string) $posts[0]['body']);
+    }
+
+    /**
+     * @dataProvider intOrNullProvider
+     */
+    public function test_int_or_null(mixed $value, ?int $expected): void
+    {
+        $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'intOrNull');
+        $method->setAccessible(true);
+
+        $this->assertSame($expected, $method->invoke(null, $value));
+    }
+
+    /** @return array<string, array{0: mixed, 1: ?int}> */
+    public static function intOrNullProvider(): array
+    {
+        return [
+            'int' => [42, 42],
+            'integral string' => ['42', 42],
+            'leading zeros' => ['007', 7],
+            'negative string' => ['-3', -3],
+            'PHP_INT_MAX spelling' => ['9223372036854775807', PHP_INT_MAX],
+            'PHP_INT_MIN spelling' => ['-9223372036854775808', PHP_INT_MIN],
+            'one past PHP_INT_MAX' => ['9223372036854775808', null],
+            'one past PHP_INT_MIN' => ['-9223372036854775809', null],
+            'saturating digit run' => ['99999999999999999999', null],
+            'trailing junk' => ['12abc', null],
+            'trailing newline' => ["12\n", null],
+            'fractional string' => ['1.5', null],
+            'float' => [1.0, null],
+            'empty string' => ['', null],
+            'null' => [null, null],
+        ];
     }
 
     // ---------------------------------------------------------------------
@@ -3676,6 +3809,12 @@ final class OpenSubtitlesProviderTest extends TestCase
             'traversal in configured format scrubbed' => ['', 'Movie', 'en', 'srt/../x', 'Movie.srt..x'],
             'control and slash in configured language scrubbed' => ['', null, "en\n/x", 'srt', 'subtitle.enx.srt'],
             'degenerate composition hits the final guard' => ['', "\x01", '', '.', 'subtitle.srt'],
+            // The provider-name branch keeps the provider's own extension but
+            // must still carry one: an extensionless name gains the format.
+            'extensionless provider name gains the format extension' => ['movie', null, 'en', 'ass', 'movie.ass'],
+            'extensionless provider name with empty format uses default' => ['movie', null, 'en', '', 'movie.srt'],
+            'extensionless provider name format scrubbed' => ['movie', null, 'en', "s/r\x01t", 'movie.srt'],
+            'provider name with its own extension kept verbatim' => ['movie.sub', null, 'en', 'srt', 'movie.sub'],
         ];
     }
 
