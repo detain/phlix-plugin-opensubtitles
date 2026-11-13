@@ -3302,7 +3302,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         } catch (QuotaExceeded $e) {
             $this->assertStringContainsString('allowed 20 subtitles for 24h', $e->getMessage());
             $this->assertSame(0, $e->getDownloadsRemaining());
-            $this->assertSame('2026-07-13T23:59:59Z', $e->getResetTimeUtc());
+            $this->assertSame('2026-07-13T23:59:59+00:00', $e->getResetTimeUtc());
         }
     }
 
