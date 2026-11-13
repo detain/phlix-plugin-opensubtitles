@@ -1611,7 +1611,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
             );
 
             throw new OpenSubtitlesException(
-                'Download failed: request body could not be JSON-encoded (' . $e->getMessage()
+                'OpenSubtitles download failed: request body could not be JSON-encoded (' . $e->getMessage()
                     . '); the configured subtitle format must be valid UTF-8',
                 0,
                 $e,
@@ -1773,7 +1773,7 @@ final class OpenSubtitlesProvider implements LifecycleInterface, ConfigurableInt
         $detail = $excerpt ?? ('HTTP ' . $statusCode);
         $this->logger->error('OpenSubtitles download failed: ' . $detail);
 
-        return new OpenSubtitlesException('Download failed: ' . $detail);
+        return new OpenSubtitlesException('OpenSubtitles download failed: ' . $detail);
     }
 
     /**

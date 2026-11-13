@@ -773,7 +773,7 @@ final class OpenSubtitlesProviderTest extends TestCase
             $provider->downloadRaw(1);
             $this->fail('Expected the 429 to surface as a failure.');
         } catch (OpenSubtitlesException $e) {
-            $this->assertStringContainsString('Download failed', $e->getMessage());
+            $this->assertStringContainsString('OpenSubtitles download failed', $e->getMessage());
         }
 
         try {
@@ -1065,7 +1065,7 @@ final class OpenSubtitlesProviderTest extends TestCase
             $provider->downloadRaw(1);
             $this->fail('Expected the 429 to surface as a failure.');
         } catch (OpenSubtitlesException $e) {
-            $this->assertStringContainsString('Download failed', $e->getMessage());
+            $this->assertStringContainsString('OpenSubtitles download failed', $e->getMessage());
         }
 
         $until = $this->privateProperty($provider, 'rateLimitedUntil');
@@ -1090,7 +1090,7 @@ final class OpenSubtitlesProviderTest extends TestCase
             $provider->downloadRaw(3);
             $this->fail('Expected the re-dialed 500 to surface.');
         } catch (OpenSubtitlesException $e) {
-            $this->assertStringContainsString('Download failed', $e->getMessage());
+            $this->assertStringContainsString('OpenSubtitles download failed', $e->getMessage());
         }
         $this->assertCount(2, $history, 'after the clamp the provider must dial again, never stay parked');
     }
@@ -1223,8 +1223,8 @@ final class OpenSubtitlesProviderTest extends TestCase
             $this->fail('Expected a generic download failure.');
         } catch (OpenSubtitlesException $e) {
             $this->assertNotInstanceOf(OpenSubtitlesQuotaExceededException::class, $e);
-            $this->assertStringStartsWith('Download failed: bad request', $e->getMessage());
-            $this->assertSingleLineBounded($e->getMessage(), strlen('Download failed: ') + self::apiMessageBudget());
+            $this->assertStringStartsWith('OpenSubtitles download failed: bad request', $e->getMessage());
+            $this->assertSingleLineBounded($e->getMessage(), strlen('OpenSubtitles download failed: ') + self::apiMessageBudget());
             $this->assertStringNotContainsString("\x1b", $e->getMessage());
         }
 
@@ -1246,7 +1246,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $provider->onEnable($this->stubContainer());
 
         $this->expectException(OpenSubtitlesException::class);
-        $this->expectExceptionMessage('Download failed: HTTP 400');
+        $this->expectExceptionMessage('OpenSubtitles download failed: HTTP 400');
         $provider->downloadRaw(1);
     }
 
@@ -2723,7 +2723,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $provider->onEnable($this->stubContainer());
 
         $this->expectException(OpenSubtitlesException::class);
-        $this->expectExceptionMessageMatches('/Download failed/');
+        $this->expectExceptionMessageMatches('/^OpenSubtitles download failed/');
 
         try {
             $provider->downloadRaw(998877);
@@ -2793,7 +2793,7 @@ final class OpenSubtitlesProviderTest extends TestCase
             $this->fail('Expected the 302 step-1 response to surface as a status failure.');
         } catch (OpenSubtitlesException $e) {
             $this->assertNotInstanceOf(OpenSubtitlesQuotaExceededException::class, $e);
-            $this->assertStringContainsString('Download failed', $e->getMessage());
+            $this->assertStringContainsString('OpenSubtitles download failed', $e->getMessage());
             $this->assertStringContainsString('HTTP 302', $e->getMessage());
             $this->assertStringNotContainsString('did not include a download link', $e->getMessage());
         }
@@ -3750,6 +3750,8 @@ final class OpenSubtitlesProviderTest extends TestCase
                     ['id' => '1', 'attributes' => ['download_count' => 9, 'files' => [['file_id' => 1, 'file_name' => 'a.srt']]]],
                     ['id' => '2', 'attributes' => ['language' => '', 'download_count' => 8, 'files' => [['file_id' => 2, 'file_name' => 'b.srt']]]],
                     ['id' => '3', 'attributes' => ['language' => 'es', 'download_count' => 7, 'files' => [['file_id' => 3, 'file_name' => 'c.srt']]]],
+                    ['id' => '4', 'attributes' => ['language' => '   ', 'download_count' => 6, 'files' => [['file_id' => 4, 'file_name' => 'd.srt']]]],
+                    ['id' => '5', 'attributes' => ['language' => ' de ', 'download_count' => 5, 'files' => [['file_id' => 5, 'file_name' => 'e.srt']]]],
                 ],
             ])),
         ], $history);
@@ -3757,9 +3759,11 @@ final class OpenSubtitlesProviderTest extends TestCase
         $provider->onEnable($this->stubContainer());
         $results = $provider->searchByImdbIdRaw('tt1');
 
-        $this->assertCount(1, $results, 'only the row carrying a real language survives parsing');
+        $this->assertCount(2, $results, 'only rows carrying a real language survive parsing');
         $this->assertSame('3', $results[0]['id']);
         $this->assertSame('es', $results[0]['language']);
+        $this->assertSame('5', $results[1]['id']);
+        $this->assertSame('de', $results[1]['language'], 'surrounding whitespace is trimmed');
     }
 
     /**
@@ -4958,7 +4962,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         } catch (OpenSubtitlesQuotaExceededException $quota) {
             $this->fail('A 5xx with quota-looking wording must not map to the quota exception.');
         } catch (OpenSubtitlesException $failure) {
-            $this->assertStringContainsString('Download failed:', $failure->getMessage());
+            $this->assertStringContainsString('OpenSubtitles download failed:', $failure->getMessage());
         }
     }
 
