@@ -19,6 +19,7 @@ use Phlix\Shared\Subtitle\Exception\QuotaExceeded;
 use Phlix\Shared\Subtitle\SubtitleCandidate;
 use Phlix\Shared\Subtitle\SubtitleFile;
 use Phlix\Shared\Subtitle\SubtitleSourceInterface;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Container\ContainerInterface;
 
@@ -869,9 +870,8 @@ final class OpenSubtitlesProviderTest extends TestCase
      * /login into a window the API already declared dead. One scenario per
      * dialing entry; searchByPathRaw pins the delegation path — the delegate
      * it reaches guards before that delegate's own dial.
-     *
-     * @dataProvider rateWindowSearchEntriesProvider
      */
+    #[DataProvider('rateWindowSearchEntriesProvider')]
     public function test_every_search_entry_refuses_locally_inside_rate_window(string $entry): void
     {
         $provider = $this->providerWithCredentials();
@@ -1045,9 +1045,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         ];
     }
 
-    /**
-     * @dataProvider hostileRetryAfterProvider
-     */
+    #[DataProvider('hostileRetryAfterProvider')]
     public function test_hostile_retry_after_is_clamped_and_redials_after_the_clamp(string $retryAfter, string $kind): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
@@ -1772,9 +1770,8 @@ final class OpenSubtitlesProviderTest extends TestCase
      * non-positive file ids); a zero or negative id reaching downloadRaw is
      * the residue of casting malformed or mutated input, and POSTing it would
      * spend a quota-metered call on a guaranteed miss. Refuse it locally.
-     *
-     * @dataProvider nonPositiveFileIdProvider
      */
+    #[DataProvider('nonPositiveFileIdProvider')]
     public function test_download_raw_refuses_non_positive_file_id_without_dialing(int $fileId): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
@@ -1838,9 +1835,8 @@ final class OpenSubtitlesProviderTest extends TestCase
      * id that would sail past downloadRaw()'s sign check and spend quota on a
      * file the candidate never named. The contract entry must refuse any
      * download id that is not an exact, in-range integer spelling.
-     *
-     * @dataProvider outOfRangeDownloadIdProvider
      */
+    #[DataProvider('outOfRangeDownloadIdProvider')]
     public function test_download_refuses_out_of_range_or_malformed_download_id_without_dialing(string $downloadId): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
@@ -1901,9 +1897,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertStringContainsString('"file_id":' . PHP_INT_MAX, (string) $posts[0]['body']);
     }
 
-    /**
-     * @dataProvider intOrNullProvider
-     */
+    #[DataProvider('intOrNullProvider')]
     public function test_int_or_null(mixed $value, ?int $expected): void
     {
         $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'intOrNull');
@@ -1962,9 +1956,8 @@ final class OpenSubtitlesProviderTest extends TestCase
      * so a bare number must be canonicalized at the request boundary: left
      * unprefixed it silently matches nothing, and callers cache that empty
      * result as a genuine miss.
-     *
-     * @dataProvider imdbIdCanonicalizationProvider
      */
+    #[DataProvider('imdbIdCanonicalizationProvider')]
     public function test_search_by_imdb_id_normalizes_every_valid_spelling_to_the_canonical_query(string $input, string $canonical): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
@@ -1996,9 +1989,8 @@ final class OpenSubtitlesProviderTest extends TestCase
      * IMDb id in any spelling: it must fail loud at the plugin boundary,
      * before any dial, instead of round-tripping the API as a silent-empty
      * match or an opaque 400.
-     *
-     * @dataProvider malformedImdbIdProvider
      */
+    #[DataProvider('malformedImdbIdProvider')]
     public function test_search_by_imdb_id_rejects_malformed_id_without_dialing(string $input): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
@@ -3654,9 +3646,7 @@ final class OpenSubtitlesProviderTest extends TestCase
     // Private utility methods
     // ---------------------------------------------------------------------
 
-    /**
-     * @dataProvider looksLikeQuotaMessageProvider
-     */
+    #[DataProvider('looksLikeQuotaMessageProvider')]
     public function test_looks_like_quota_message(string $message, bool $expected): void
     {
         $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'looksLikeQuotaMessage');
@@ -3766,9 +3756,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertSame('de', $results[1]['language'], 'surrounding whitespace is trimmed');
     }
 
-    /**
-     * @dataProvider languageFilterProvider
-     */
+    #[DataProvider('languageFilterProvider')]
     public function test_language_filter(array $languages, ?string $expected): void
     {
         $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'languageFilter');
@@ -3807,9 +3795,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         $this->assertStringNotContainsString('pt-BR', (string) $method->invoke(null, ['pt-BR', 'pt']));
     }
 
-    /**
-     * @dataProvider withLanguagesProvider
-     */
+    #[DataProvider('withLanguagesProvider')]
     public function test_with_languages(array $params, ?string $languageCsv, array $expected): void
     {
         $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'withLanguages');
@@ -3828,9 +3814,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         ];
     }
 
-    /**
-     * @dataProvider safeFilenameProvider
-     */
+    #[DataProvider('safeFilenameProvider')]
     public function test_safe_filename(string $providerName, ?string $releaseName, string $language, string $format, string $expected): void
     {
         $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'safeFilename');
@@ -3868,9 +3852,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         ];
     }
 
-    /**
-     * @dataProvider floatOrNullProvider
-     */
+    #[DataProvider('floatOrNullProvider')]
     public function test_float_or_null(mixed $value, ?float $expected): void
     {
         $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'floatOrNull');
@@ -3892,9 +3874,7 @@ final class OpenSubtitlesProviderTest extends TestCase
         ];
     }
 
-    /**
-     * @dataProvider truthyProvider
-     */
+    #[DataProvider('truthyProvider')]
     public function test_truthy(mixed $value, bool $expected): void
     {
         $method = new \ReflectionMethod(OpenSubtitlesProvider::class, 'truthy');
@@ -4312,9 +4292,8 @@ final class OpenSubtitlesProviderTest extends TestCase
      * primitive against arbitrary HTTPS endpoints the resident worker can
      * reach. The refusal happens after step 1 (the quota POST) and before
      * any second dial.
-     *
-     * @dataProvider untrustedDownloadLinkProvider
      */
+    #[DataProvider('untrustedDownloadLinkProvider')]
     public function test_download_link_outside_the_trust_domain_is_refused_without_dialing(string $link): void
     {
         $provider = new OpenSubtitlesProvider(apiKey: self::TEST_API_KEY);
